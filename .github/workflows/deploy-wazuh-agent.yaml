@@ -1,7 +1,9 @@
 name: Deploy Wazuh Agent
+
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
     paths:
       - 'manifests/**'
       - '.github/workflows/deploy-wazuh-agent.yaml'
@@ -9,43 +11,60 @@ on:
 
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
+    runs-on:
+      - self-hosted
+      - linux
+      - ronin
+      - k8s
+      - control-plane
+
     env:
-      # <- set your desired 4.12 tag ONCE here
+      # Pick your desired 4.12 tag once here (e.g., 4.12.2 or 4.12.1)
       WAZUH_AGENT_TAG: '4.12.2'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install kubectl + jq
         run: |
-          curl -sSL -o kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          set -e
+          curl -sSL -o kubectl "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
           chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
           sudo apt-get update -y && sudo apt-get install -y jq
           kubectl version --client --output=yaml
 
       - name: Write kubeconfig from secret
-        env: { KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }} }
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
-          mkdir -p ~/.kube
-          echo "$KUBE_CONFIG_B64" | base64 -d > ~/.kube/config
-          chmod 600 ~/.kube/config
+          set -e
+          mkdir -p "$HOME/.kube"
+          echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
           kubectl config current-context
 
       - name: Verify image tag exists on Docker Hub
         env:
           IMG: "wazuh/wazuh-agent"
         run: |
-          curl -s "https://registry.hub.docker.com/v2/repositories/${IMG}/tags?page_size=10000" \
-            | jq -r '.results[].name' | grep -Fx "${WAZUH_AGENT_TAG}"
+          set -e
+          echo "Checking tag ${WAZUH_AGENT_TAG} for ${IMG}…"
+          TAGS_JSON=$(curl -fsSL "https://registry.hub.docker.com/v2/repositories/${IMG}/tags?page_size=10000")
+          echo "$TAGS_JSON" | jq -r '.results[].name' | grep -Fx "${WAZUH_AGENT_TAG}" \
+            || { echo "❌ Tag '${WAZUH_AGENT_TAG}' not found for ${IMG}. Try 4.12.1 or a published 4.12.x tag."; exit 1; }
+          echo "✅ Tag exists."
 
       - name: Render manifest with tag
         run: |
+          set -e
           sed "s|\${WAZUH_AGENT_TAG}|${WAZUH_AGENT_TAG}|g" manifests/wazuh-agent.tmpl.yaml > manifests/_rendered.yaml
-          echo "Rendered image tag:"; grep 'image:' manifests/_rendered.yaml
+          echo "Rendered image line:"
+          grep -n 'image:' manifests/_rendered.yaml || true
 
       - name: Apply rendered manifest
         run: |
+          set -e
           kubectl apply -f manifests/_rendered.yaml
-          kubectl -n wazuh rollout status ds/wazuh-agent --timeout=240s || true
-          kubectl -n wazuh get pods -l app=wazuh-agent -o wide
+          kubectl -n wazuh rollout status ds/wazuh-agent --timeout=300s || true
+          kubectl -n wazuh get pods -l app=wazuh-agent -o wide || true
