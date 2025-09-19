@@ -15,28 +15,28 @@ data:
     <ossec_config>
       <client>
         <server>
-          <!-- CHANGE THIS if your manager DNS differs -->
+          <!-- CHANGE address if your manager Service/DNS differs -->
           <address>wazuh.wazuh.svc.cluster.local</address>
           <port>1514</port>
           <protocol>tcp</protocol>
         </server>
       </client>
 
-      <!-- CRI/container logs (line-based text) -->
+      <!-- CRI/container logs -->
       <localfile>
         <location>/host/var/log/containers/*.log</location>
         <log_format>syslog</log_format>
         <only-future-events>yes</only-future-events>
       </localfile>
 
-      <!-- Pod logs by container -->
+      <!-- Pod logs -->
       <localfile>
         <location>/host/var/log/pods/*/*/*.log</location>
         <log_format>syslog</log_format>
         <only-future-events>yes</only-future-events>
       </localfile>
 
-      <!-- Optional: host syslog (Ubuntu nodes) -->
+      <!-- Optional: Ubuntu node syslog -->
       <localfile>
         <location>/host/var/log/syslog</location>
         <log_format>syslog</log_format>
@@ -62,7 +62,6 @@ spec:
       labels:
         app: wazuh-agent
     spec:
-      # Use the node's network so agent can reach the manager on node routing
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -82,13 +81,9 @@ spec:
             runAsUser: 0
           env:
             - name: NODE_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.nodeName
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
             - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: AGENT_NAME
               value: "$(NODE_NAME)-$(POD_NAME)"
             - name: AUTHD_PORT
@@ -100,30 +95,22 @@ spec:
           command: ["/bin/sh","-c"]
           args:
             - |
-              # Prepare runtime dirs
+              set -e
               mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
-
-              # Write config from ConfigMap
               cp /config/ossec.conf /var/ossec/etc/ossec.conf
-
-              # Clean stale pids/locks
               rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
 
-              # Enroll with the manager if not already enrolled
               if [ ! -s /var/ossec/etc/client.keys ]; then
-                echo "No client keys found, attempting enrollment to ${MANAGER_DNS}:${AUTHD_PORT}…"
-                /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" || echo "Enrollment finished (ignore duplicate warnings)"
+                echo "No client keys found, enrolling to ${MANAGER_DNS}:${AUTHD_PORT}…"
+                /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" || echo "Enrollment finished (duplicates ok)"
               fi
 
               echo "Starting Wazuh agent…"
               /var/ossec/bin/wazuh-control start
-
               sleep 5
               if /var/ossec/bin/wazuh-control status | grep -q "is running"; then
-                echo "Wazuh agent started successfully on ${AGENT_NAME}"
                 tail -f /var/ossec/logs/ossec.log
               else
-                echo "Wazuh agent failed to start"
                 /var/ossec/bin/wazuh-control status || true
                 exit 1
               fi
@@ -142,12 +129,8 @@ spec:
             failureThreshold: 3
             timeoutSeconds: 5
           resources:
-            requests:
-              cpu: "100m"
-              memory: "256Mi"
-            limits:
-              cpu: "1000m"
-              memory: "1024Mi"
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits:   { cpu: "1000m", memory: "1024Mi" }
           volumeMounts:
             - name: ossec-conf-cm
               mountPath: /config
@@ -166,14 +149,8 @@ spec:
           configMap:
             name: wazuh-agent-ossec
         - name: varlogcontainers
-          hostPath:
-            path: /var/log/containers
-            type: DirectoryOrCreate
+          hostPath: { path: /var/log/containers, type: DirectoryOrCreate }
         - name: varlogpods
-          hostPath:
-            path: /var/log/pods
-            type: DirectoryOrCreate
+          hostPath: { path: /var/log/pods, type: DirectoryOrCreate }
         - name: varlog
-          hostPath:
-            path: /var/log
-            type: Directory
+          hostPath: { path: /var/log, type: Directory }
