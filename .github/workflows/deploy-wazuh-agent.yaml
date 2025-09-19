@@ -1,0 +1,39 @@
+name: Deploy Wazuh Agent
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'manifests/wazuh-agent.yaml'
+      - '.github/workflows/deploy-wazuh-agent.yaml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    # Use your self-hosted runner labels (adjust if yours differ)
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        run: |
+          curl -sSL -o kubectl https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client --output=yaml
+
+      - name: Write kubeconfig from secret
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG_B64" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+          kubectl config current-context
+
+      - name: Apply Wazuh Agent manifest
+        run: |
+          kubectl apply -f manifests/wazuh-agent.yaml
+          kubectl -n wazuh rollout status ds/wazuh-agent --timeout=240s || true
+          kubectl -n wazuh get pods -l app=wazuh-agent -o wide
