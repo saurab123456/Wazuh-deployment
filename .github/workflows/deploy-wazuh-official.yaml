@@ -28,10 +28,10 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Verify KUBE_CONFIG secret exists
+      - name: Verify kubeconfig secret exists
         run: |
-          if [ -z "${{ secrets.KUBE_CONFIG }}" ]; then
-            echo "::error::Missing KUBE_CONFIG secret (Settings → Secrets → Actions)."
+          if [ -z "${{ secrets.KUBE_CONFIG_B64 }}" ]; then
+            echo "::error::Missing KUBE_CONFIG_B64 secret (Settings → Secrets → Actions)."
             exit 1
           fi
 
@@ -46,41 +46,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssl jq
 
-      # --- FIXED kubeconfig writer (handles raw, base64, or \n-escaped) ---
+      # --- Write kubeconfig from base64 (authoritative) ---
       - name: Write kubeconfig
         env:
-          KUBE_CONFIG_SECRET: ${{ secrets.KUBE_CONFIG }}
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.kube"
-          tmp="$(mktemp)"
-          printf '%s' "${KUBE_CONFIG_SECRET}" > "$tmp"
-
           out="$HOME/.kube/config"
-          if base64 -d "$tmp" >/dev/null 2>&1; then
-            base64 -d "$tmp" > "$out"
-          elif grep -q '\\n' "$tmp"; then
-            # turn literal \n into real newlines
-            printf '%b' "$(cat "$tmp")" > "$out"
-          else
-            cp "$tmp" "$out"
-          fi
 
-          # normalise CRLF just in case
-          tr -d '\r' <"$out" >"$out.tmp" && mv "$out.tmp" "$out"
+          echo "${KUBE_CONFIG_B64}" | base64 -d > "$out"
+          # normalize CRLF just in case
+          tr -d '\r' < "$out" > "$out.tmp" && mv "$out.tmp" "$out"
           chmod 600 "$out"
-          echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
+          echo "KUBECONFIG=$out" >> "$GITHUB_ENV"
 
-          # non-secret sanity check
+          echo "First 5 lines of kubeconfig (sanity):"
           head -n 5 "$out" || true
-          grep -q '^apiVersion:' "$out" || { echo 'kubeconfig missing apiVersion'; exit 1; }
+          # Let kubectl parse it; fail early if invalid
+          kubectl --kubeconfig="$out" config get-contexts >/dev/null
 
       - name: Show cluster and nodes
         run: |
           set -euxo pipefail
           echo "Context: $(kubectl config current-context || true)"
           echo "API server: $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' || true)"
-          kubectl version --short
+          # Portable client version output (no --short)
+          kubectl version --client=true -o yaml || kubectl version --client=true || true
           kubectl get nodes -o wide
 
       - name: Runner breadcrumb on Ronin
