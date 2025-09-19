@@ -1,13 +1,14 @@
-name: Deploy Wazuh Agent
+name: Deploy Wazuh Agent (manual)
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'manifests/**'
-      - '.github/workflows/deploy-wazuh-agent.yaml'
   workflow_dispatch:
+
+concurrency:
+  group: deploy-wazuh-agent
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   deploy:
@@ -18,53 +19,54 @@ jobs:
       - k8s
       - control-plane
 
-    env:
-      # Pick your desired 4.12 tag once here (e.g., 4.12.2 or 4.12.1)
-      WAZUH_AGENT_TAG: '4.12.2'
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install kubectl + jq
+      - name: Install kubectl
+        shell: bash
         run: |
-          set -e
-          curl -sSL -o kubectl "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
-          sudo apt-get update -y && sudo apt-get install -y jq
+          set -euo pipefail
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
           kubectl version --client --output=yaml
 
       - name: Write kubeconfig from secret
+        shell: bash
         env:
           KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
-          set -e
+          set -euo pipefail
+          test -n "$KUBE_CONFIG_B64"
           mkdir -p "$HOME/.kube"
           echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
           kubectl config current-context
 
-      - name: Verify image tag exists on Docker Hub
+      # OPTIONAL: only needed if your GHCR image is private and you set these secrets.
+      - name: Create/Update GHCR pull secret (ghcr-cred)
+        if: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_PAT != '' }}
+        shell: bash
         env:
-          IMG: "wazuh/wazuh-agent"
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
         run: |
-          set -e
-          echo "Checking tag ${WAZUH_AGENT_TAG} for ${IMG}…"
-          TAGS_JSON=$(curl -fsSL "https://registry.hub.docker.com/v2/repositories/${IMG}/tags?page_size=10000")
-          echo "$TAGS_JSON" | jq -r '.results[].name' | grep -Fx "${WAZUH_AGENT_TAG}" \
-            || { echo "❌ Tag '${WAZUH_AGENT_TAG}' not found for ${IMG}. Try 4.12.1 or a published 4.12.x tag."; exit 1; }
-          echo "✅ Tag exists."
+          set -euo pipefail
+          kubectl create namespace wazuh --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n wazuh create secret docker-registry ghcr-cred \
+            --docker-server=ghcr.io \
+            --docker-username="$GHCR_USERNAME" \
+            --docker-password="$GHCR_PAT" \
+            --docker-email=unused@example.com \
+            -o yaml --dry-run=client | kubectl apply -f -
 
-      - name: Render manifest with tag
+      - name: Apply Wazuh Agent manifest
+        shell: bash
         run: |
-          set -e
-          sed "s|\${WAZUH_AGENT_TAG}|${WAZUH_AGENT_TAG}|g" manifests/wazuh-agent.tmpl.yaml > manifests/_rendered.yaml
-          echo "Rendered image line:"
-          grep -n 'image:' manifests/_rendered.yaml || true
-
-      - name: Apply rendered manifest
-        run: |
-          set -e
-          kubectl apply -f manifests/_rendered.yaml
+          set -euo pipefail
+          # Assumes your manifest is at manifests/wazuh-agent.yaml
+          # (and uses ghcr.io/<OWNER>/wazuh-agent:4.12.0 or whatever you pushed)
+          kubectl apply -f manifests/wazuh-agent.yaml
           kubectl -n wazuh rollout status ds/wazuh-agent --timeout=300s || true
           kubectl -n wazuh get pods -l app=wazuh-agent -o wide || true
