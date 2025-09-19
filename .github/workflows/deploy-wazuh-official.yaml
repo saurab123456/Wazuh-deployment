@@ -35,16 +35,19 @@ jobs:
             exit 1
           fi
 
-      - name: Setup kubectl (pin close to cluster)
+      - name: Setup kubectl (pin to your cluster version)
         uses: azure/setup-kubectl@v4
         with:
           version: 'v1.30.14'
 
-      - name: Install openssl and jq
+      - name: Install openssl, jq, yq
         run: |
           set -euxo pipefail
           sudo apt-get update
           sudo apt-get install -y openssl jq
+          sudo curl -L https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -o /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
 
       # --- kubeconfig from base64 (authoritative) ---
       - name: Write kubeconfig
@@ -91,42 +94,32 @@ jobs:
           echo "Generated cert files (sample):"
           find wazuh/certs -type f \( -name "*.pem" -o -name "*.key" \) | head -n 20
 
-      - name: Dry run build (client-side with kubectl kustomize)
-        working-directory: ./wazuh-kubernetes
-        run: |
-          set -euxo pipefail
-          kubectl kustomize envs/local-env | head -n 60
-
       - name: Ensure wazuh namespace exists
         run: |
           set -euxo pipefail
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # --- IMPORTANT: make wazuh-storage match your default provisioner (e.g., rancher.io/local-path) ---
+      # --- Make wazuh-storage alias your default provisioner (e.g., rancher.io/local-path) ---
       - name: Ensure 'wazuh-storage' StorageClass (alias of default)
         run: |
           set -euxo pipefail
-          # Find default SC; if none annotated default, pick the first
           DEF_SC=$(kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' \
                    | awk '$2=="true"{print $1}' | head -n1)
           if [ -z "$DEF_SC" ]; then
             DEF_SC=$(kubectl get storageclass -o jsonpath='{.items[0].metadata.name}')
           fi
           echo "Default StorageClass: ${DEF_SC}"
-
           DEF_PROV=$(kubectl get sc "$DEF_SC" -o jsonpath='{.provisioner}')
           echo "Default provisioner: ${DEF_PROV}"
 
-          # If wazuh-storage exists but with wrong provisioner, replace it
+          # Recreate wazuh-storage if it exists with a different provisioner
           if kubectl get sc wazuh-storage >/dev/null 2>&1; then
             CUR_PROV=$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}')
             if [ "$CUR_PROV" != "$DEF_PROV" ]; then
-              echo "Replacing existing wazuh-storage (provisioner=$CUR_PROV) with $DEF_PROV"
               kubectl delete sc wazuh-storage
             fi
           fi
 
-          # Create (or re-create) wazuh-storage alias
           if ! kubectl get sc wazuh-storage >/dev/null 2>&1; then
             cat > /tmp/wazuh-storage.yaml <<EOF
           apiVersion: storage.k8s.io/v1
@@ -141,20 +134,28 @@ jobs:
             kubectl apply -f /tmp/wazuh-storage.yaml
           fi
 
-          echo "StorageClasses:"
           kubectl get storageclass -o wide
 
-      - name: Server dry-run apply (catches RBAC/schema)
+      # --- Build manifests and drop any StorageClass resources to avoid immutability conflicts ---
+      - name: Build manifests (strip StorageClass)
         working-directory: ./wazuh-kubernetes
         run: |
           set -euxo pipefail
-          kubectl apply -k envs/local-env/ --dry-run=server
+          kubectl kustomize envs/local-env > /tmp/wazuh-all.yaml
+          # Remove any StorageClass objects from upstream
+          yq 'select(.kind != "StorageClass")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sc.yaml
+          echo "First docs after filtering:"
+          head -n 80 /tmp/wazuh-no-sc.yaml || true
 
-      - name: Apply manifests (local-env)
-        working-directory: ./wazuh-kubernetes
+      - name: Server dry-run apply (catches RBAC/schema)
         run: |
           set -euxo pipefail
-          kubectl apply -k envs/local-env/
+          kubectl apply -f /tmp/wazuh-no-sc.yaml --dry-run=server
+
+      - name: Apply manifests (no StorageClass)
+        run: |
+          set -euxo pipefail
+          kubectl apply -f /tmp/wazuh-no-sc.yaml
 
       - name: Wait for PVCs to bind (wazuh namespace)
         run: |
