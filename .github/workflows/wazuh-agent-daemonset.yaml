@@ -1,0 +1,179 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wazuh
+  labels:
+    app.kubernetes.io/name: wazuh
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wazuh-agent-ossec
+  namespace: wazuh
+data:
+  ossec.conf: |
+    <ossec_config>
+      <client>
+        <server>
+          <!-- CHANGE THIS if your manager DNS differs -->
+          <address>wazuh.wazuh.svc.cluster.local</address>
+          <port>1514</port>
+          <protocol>tcp</protocol>
+        </server>
+      </client>
+
+      <!-- CRI/container logs (line-based text) -->
+      <localfile>
+        <location>/host/var/log/containers/*.log</location>
+        <log_format>syslog</log_format>
+        <only-future-events>yes</only-future-events>
+      </localfile>
+
+      <!-- Pod logs by container -->
+      <localfile>
+        <location>/host/var/log/pods/*/*/*.log</location>
+        <log_format>syslog</log_format>
+        <only-future-events>yes</only-future-events>
+      </localfile>
+
+      <!-- Optional: host syslog (Ubuntu nodes) -->
+      <localfile>
+        <location>/host/var/log/syslog</location>
+        <log_format>syslog</log_format>
+        <only-future-events>yes</only-future-events>
+      </localfile>
+    </ossec_config>
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: wazuh-agent
+  namespace: wazuh
+  labels:
+    app: wazuh-agent
+spec:
+  selector:
+    matchLabels:
+      app: wazuh-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: wazuh-agent
+    spec:
+      # Use the node's network so agent can reach the manager on node routing
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: wazuh-agent
+          image: wazuh/wazuh-agent:4.12.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AGENT_NAME
+              value: "$(NODE_NAME)-$(POD_NAME)"
+            - name: AUTHD_PORT
+              value: "1515"
+            - name: MANAGER_DNS
+              value: "wazuh.wazuh.svc.cluster.local"
+            - name: GROUPS
+              value: "kubernetes"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              # Prepare runtime dirs
+              mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
+
+              # Write config from ConfigMap
+              cp /config/ossec.conf /var/ossec/etc/ossec.conf
+
+              # Clean stale pids/locks
+              rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+
+              # Enroll with the manager if not already enrolled
+              if [ ! -s /var/ossec/etc/client.keys ]; then
+                echo "No client keys found, attempting enrollment to ${MANAGER_DNS}:${AUTHD_PORT}…"
+                /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" || echo "Enrollment finished (ignore duplicate warnings)"
+              fi
+
+              echo "Starting Wazuh agent…"
+              /var/ossec/bin/wazuh-control start
+
+              sleep 5
+              if /var/ossec/bin/wazuh-control status | grep -q "is running"; then
+                echo "Wazuh agent started successfully on ${AGENT_NAME}"
+                tail -f /var/ossec/logs/ossec.log
+              else
+                echo "Wazuh agent failed to start"
+                /var/ossec/bin/wazuh-control status || true
+                exit 1
+              fi
+          readinessProbe:
+            exec:
+              command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"']
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 6
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"']
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+            timeoutSeconds: 5
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1024Mi"
+          volumeMounts:
+            - name: ossec-conf-cm
+              mountPath: /config
+              readOnly: true
+            - name: varlogcontainers
+              mountPath: /host/var/log/containers
+              readOnly: true
+            - name: varlogpods
+              mountPath: /host/var/log/pods
+              readOnly: true
+            - name: varlog
+              mountPath: /host/var/log
+              readOnly: true
+      volumes:
+        - name: ossec-conf-cm
+          configMap:
+            name: wazuh-agent-ossec
+        - name: varlogcontainers
+          hostPath:
+            path: /var/log/containers
+            type: DirectoryOrCreate
+        - name: varlogpods
+          hostPath:
+            path: /var/log/pods
+            type: DirectoryOrCreate
+        - name: varlog
+          hostPath:
+            path: /var/log
+            type: Directory
