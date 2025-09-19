@@ -1,95 +1,185 @@
-name: Deploy Wazuh (Official 4.12.0 with NodePort 32563)
+name: Deploy Wazuh (4.12.0, auto on commit)
 
 on:
-  workflow_dispatch:
-    inputs:
-      env:
-        description: "Kustomize env (eks or local-env)"
-        required: true
-        default: "local-env"
+  push:
+    branches: [ "main" ]
+    paths:
+      - ".github/workflows/**"
+      - "wazuh/**"
+      - "envs/**"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - "README.md"
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-wazuh
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      NS: wazuh
+      WAZUH_TAG: v4.12.0
+      DASH_PORT: 32563
 
     steps:
-      - name: Checkout repo
+      - name: Checkout this repo
         uses: actions/checkout@v4
+
+      - name: Verify required secret exists
+        run: |
+          if [ -z "${{ secrets.KUBE_CONFIG }}" ]; then
+            echo "::error::Missing KUBE_CONFIG secret (Settings → Secrets → Actions)."
+            exit 1
+          fi
 
       - name: Setup kubectl
         uses: azure/setup-kubectl@v4
         with:
           version: 'latest'
 
-      - name: Setup kustomize
+      - name: Install kustomize, openssl, jq
         run: |
-          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/latest/download/kustomize_linux_amd64.tar.gz" \
-          | tar -xz && sudo mv kustomize /usr/local/bin/kustomize
+          set -euxo pipefail
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/latest/download/kustomize_linux_amd64.tar.gz" | tar -xz
+          sudo mv kustomize /usr/local/bin/kustomize
+          kustomize version
+          sudo apt-get update
+          sudo apt-get install -y openssl jq
 
       - name: Write kubeconfig
         run: |
-          echo "${KUBE_CONFIG}" > $HOME/kubeconfig
-          chmod 600 $HOME/kubeconfig
-          echo "KUBECONFIG=$HOME/kubeconfig" >> $GITHUB_ENV
+          set -euxo pipefail
+          mkdir -p "$HOME/.kube"
+          echo "${KUBE_CONFIG}" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
 
-      - name: Clone official wazuh-kubernetes (v4.12.0)
+      - name: Sanity: show cluster & nodes
         run: |
-          git clone https://github.com/wazuh/wazuh-kubernetes.git -b v4.12.0 --depth=1
+          set -euxo pipefail
+          kubectl version --short
+          kubectl config current-context
+          kubectl get nodes -o wide
 
-      - name: Generate self-signed certs
+      - name: Clone official wazuh-kubernetes (${{ env.WAZUH_TAG }})
+        run: |
+          set -euxo pipefail
+          rm -rf wazuh-kubernetes
+          git clone https://github.com/wazuh/wazuh-kubernetes.git -b "${WAZUH_TAG}" --depth=1
+          ls -la wazuh-kubernetes
+
+      - name: Generate required self-signed certificates (per docs)
         working-directory: ./wazuh-kubernetes
         run: |
+          set -euxo pipefail
           bash wazuh/certs/indexer_cluster/generate_certs.sh
           bash wazuh/certs/dashboard_http/generate_certs.sh
+          echo "Generated cert files:"
+          find wazuh/certs -type f | head -n 20
 
-      - name: Apply manifests with kustomize
+      - name: (Optional) Set StorageClass provisioner for local-env
+        working-directory: ./wazuh-kubernetes
+        env:
+          STORAGE_PROVISIONER: ${{ secrets.STORAGE_PROVISIONER }}
+        run: |
+          set -euxo pipefail
+          if [ -n "${STORAGE_PROVISIONER:-}" ]; then
+            echo "Setting envs/local-env/storage-class.yaml provisioner to: ${STORAGE_PROVISIONER}"
+            sed -i "s|^provisioner:.*|provisioner: ${STORAGE_PROVISIONER}|" envs/local-env/storage-class.yaml
+            grep -n 'provisioner:' envs/local-env/storage-class.yaml || true
+          else
+            echo "No STORAGE_PROVISIONER secret provided; leaving storage class as-is."
+          fi
+
+      - name: Dry-run build (catch kustomize errors early)
         working-directory: ./wazuh-kubernetes
         run: |
-          if [ "${ENVSEL}" = "eks" ]; then
-            kubectl apply -k envs/eks/
-          else
-            kubectl apply -k envs/local-env/
-          fi
-        env:
-          ENVSEL: ${{ github.event.inputs.env }}
+          set -euxo pipefail
+          kustomize build envs/local-env | head -n 60
 
-      # --- NEW: Force dashboard Service to NodePort 32563 ---
-      - name: Expose dashboard on fixed NodePort 32563
+      - name: Apply manifests with kustomize (local-env)
+        working-directory: ./wazuh-kubernetes
         run: |
-          NS="wazuh"
-          SVC="dashboard"
-          PORT=32563
+          set -euxo pipefail
+          kubectl apply -k envs/local-env/
 
-          # Wait until the Service exists (in case the API is a little slow)
-          for i in $(seq 1 30); do
-            if kubectl -n "$NS" get svc "$SVC" >/dev/null 2>&1; then
-              break
-            fi
-            sleep 3
+      - name: Wait for core components (label-based)
+        run: |
+          set -euxo pipefail
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-dashboard --timeout=600s || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-indexer --timeout=600s || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-manager --timeout=600s || true
+          kubectl -n "$NS" get pods -o wide || true
+
+      - name: Expose dashboard on fixed NodePort ${{ env.DASH_PORT }}
+        run: |
+          set -euxo pipefail
+          # In 4.12 docs, the dashboard Service is named "dashboard"; detect by label to be safe
+          SVC=$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$SVC" ]; then
+            echo "::warning::Dashboard Service not found yet; skipping patch."
+          else
+            kubectl -n "$NS" patch svc "$SVC" --type='merge' -p "{
+              \"spec\": {
+                \"type\": \"NodePort\",
+                \"ports\": [{
+                  \"name\": \"https\",
+                  \"port\": 443,
+                  \"targetPort\": 443,
+                  \"protocol\": \"TCP\",
+                  \"nodePort\": ${DASH_PORT}
+                }]
+              }
+            }"
+            kubectl -n "$NS" get svc "$SVC" -o wide
+            echo "URL: https://<any-node-ip>:${DASH_PORT}"
+          fi
+
+      - name: Quick status
+        run: |
+          set -euxo pipefail
+          echo "=== Pods ==="
+          kubectl -n "$NS" get pods -o wide || true
+          echo "=== Services ==="
+          kubectl -n "$NS" get svc -o wide || true
+          echo "=== PVCs ==="
+          kubectl -n "$NS" get pvc -o wide || true
+          echo "=== Deployments/StatefulSets ==="
+          kubectl -n "$NS" get statefulsets,deploy -o wide || true
+
+      - name: Collect diagnostics (artifacts)
+        if: always()
+        run: |
+          set -euxo pipefail
+          mkdir -p diag
+          kubectl -n "$NS" get all -o wide > diag/get-all.txt 2>&1 || true
+          kubectl -n "$NS" get events --sort-by=.lastTimestamp > diag/events.txt 2>&1 || true
+          kubectl -n "$NS" get pods -o yaml > diag/pods.yaml 2>&1 || true
+          kubectl -n "$NS" get pvc -o yaml > diag/pvc.yaml 2>&1 || true
+          kubectl get storageclass -o yaml > diag/storageclass.yaml 2>&1 || true
+          kubectl -n "$NS" get svc -o yaml > diag/svc.yaml 2>&1 || true
+          for pod in $(kubectl -n "$NS" get pods -o name); do
+            pn=${pod#pod/}
+            kubectl -n "$NS" logs "$pod" --all-containers=true --prefix=true > "diag/logs-${pn}.txt" 2>&1 || true
+            kubectl -n "$NS" describe "$pod" > "diag/describe-${pn}.txt" 2>&1 || true
           done
 
-          # Patch the service to NodePort 32563 (idempotent)
-          kubectl -n "$NS" patch svc "$SVC" --type='merge' -p "{
-            \"spec\": {
-              \"type\": \"NodePort\",
-              \"ports\": [{
-                \"name\": \"https\",
-                \"port\": 443,
-                \"targetPort\": 443,
-                \"protocol\": \"TCP\",
-                \"nodePort\": ${PORT}
-              }]
-            }
-          }"
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wazuh-diagnostics-${{ github.run_id }}
+          path: diag/**
 
-          echo "Dashboard exposed at https://<node-ip>:${PORT}"
-
-      - name: Show objects and URL hint
+      - name: Health check & URL hint
         run: |
-          kubectl -n wazuh get pods -o wide
-          kubectl -n wazuh get svc dashboard -o wide
-          echo ""
-          echo "Open: https://<any-node-ip>:32563"
-          echo "Login with default credentials (unchanged)."
+          set -euxo pipefail
+          kubectl -n "$NS" get pods -o wide || true
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' 2>/dev/null || echo "<node-ip>")
+          echo "Wazuh Dashboard URL: https://${NODE_IP}:${DASH_PORT}"
+          echo "Accept the self-signed certificate warning."
