@@ -99,41 +99,36 @@ jobs:
           set -euxo pipefail
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # --- Make wazuh-storage alias your default provisioner (e.g., rancher.io/local-path) ---
+      # --- Improved StorageClass configuration ---
       - name: Ensure 'wazuh-storage' StorageClass (alias of default)
         run: |
           set -euxo pipefail
-          DEF_SC=$(kubectl get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' \
-                   | awk '$2=="true"{print $1}' | head -n1)
+          # Get the correct default StorageClass provisioner using JSON parsing
+          DEF_SC=$(kubectl get storageclass -o json | jq -r '.items[] | select(.metadata.annotations."storageclass.kubernetes.io/is-default-class" == "true") | .metadata.name' | head -n1)
+          
           if [ -z "$DEF_SC" ]; then
             DEF_SC=$(kubectl get storageclass -o jsonpath='{.items[0].metadata.name}')
           fi
+          
           echo "Default StorageClass: ${DEF_SC}"
           DEF_PROV=$(kubectl get sc "$DEF_SC" -o jsonpath='{.provisioner}')
           echo "Default provisioner: ${DEF_PROV}"
 
-          # Recreate wazuh-storage if it exists with a different provisioner
-          if kubectl get sc wazuh-storage >/dev/null 2>&1; then
-            CUR_PROV=$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}')
-            if [ "$CUR_PROV" != "$DEF_PROV" ]; then
-              kubectl delete sc wazuh-storage
-            fi
-          fi
+          # Delete existing wazuh-storage if it exists
+          kubectl delete sc wazuh-storage --ignore-not-found
 
-          if ! kubectl get sc wazuh-storage >/dev/null 2>&1; then
-            cat > /tmp/wazuh-storage.yaml <<EOF
-          apiVersion: storage.k8s.io/v1
-          kind: StorageClass
-          metadata:
-            name: wazuh-storage
-          provisioner: ${DEF_PROV}
-          reclaimPolicy: Delete
-          volumeBindingMode: WaitForFirstConsumer
-          allowVolumeExpansion: true
-          EOF
-            kubectl apply -f /tmp/wazuh-storage.yaml
-          fi
-
+          # Create correct wazuh-storage StorageClass
+          cat > /tmp/wazuh-storage.yaml <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: wazuh-storage
+provisioner: ${DEF_PROV}
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+EOF
+          kubectl apply -f /tmp/wazuh-storage.yaml
           kubectl get storageclass -o wide
 
       # --- Build manifests and drop any StorageClass resources to avoid immutability conflicts ---
@@ -157,12 +152,24 @@ jobs:
           set -euxo pipefail
           kubectl apply -f /tmp/wazuh-no-sc.yaml
 
+      - name: Clean up stuck resources if needed
+        run: |
+          set -euxo pipefail
+          # Delete any stuck PVCs that might be preventing new ones from binding
+          if kubectl -n "$NS" get pvc --no-headers 2>/dev/null | grep -q Pending; then
+            echo "Deleting stuck PVCs..."
+            kubectl -n "$NS" delete pvc --all
+            sleep 10
+          fi
+
       - name: Wait for PVCs to bind (wazuh namespace)
         run: |
           set -euxo pipefail
+          echo "Waiting for PVCs to be created..."
+          sleep 30
           if kubectl -n "$NS" get pvc --no-headers 2>/dev/null | grep -q .; then
             echo "Waiting for all PVCs in namespace '$NS' to be Bound..."
-            timeout 600 bash -c 'until [ -z "$(kubectl -n '"$NS"' get pvc --no-headers | awk '"'"'{print $2}'"'"' | grep -v Bound)" ]; do kubectl -n '"$NS"' get pvc; sleep 5; done'
+            timeout 600 bash -c 'until [ -z "$(kubectl -n '"$NS"' get pvc --no-headers | awk '"'"'{print $2}'"'"' | grep -v Bound)" ]; do kubectl -n '"$NS"' get pvc; sleep 10; done'
           else
             echo "No PVCs found (yet)."
           fi
