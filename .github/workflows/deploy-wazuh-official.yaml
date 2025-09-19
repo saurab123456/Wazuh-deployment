@@ -46,15 +46,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssl jq
 
+      # --- FIXED kubeconfig writer (handles raw, base64, or \n-escaped) ---
       - name: Write kubeconfig
         env:
-          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+          KUBE_CONFIG_SECRET: ${{ secrets.KUBE_CONFIG }}
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           mkdir -p "$HOME/.kube"
-          printf "%s" "$KUBE_CONFIG" > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
+          tmp="$(mktemp)"
+          printf '%s' "${KUBE_CONFIG_SECRET}" > "$tmp"
+
+          out="$HOME/.kube/config"
+          if base64 -d "$tmp" >/dev/null 2>&1; then
+            base64 -d "$tmp" > "$out"
+          elif grep -q '\\n' "$tmp"; then
+            # turn literal \n into real newlines
+            printf '%b' "$(cat "$tmp")" > "$out"
+          else
+            cp "$tmp" "$out"
+          fi
+
+          # normalise CRLF just in case
+          tr -d '\r' <"$out" >"$out.tmp" && mv "$out.tmp" "$out"
+          chmod 600 "$out"
           echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
+
+          # non-secret sanity check
+          head -n 5 "$out" || true
+          grep -q '^apiVersion:' "$out" || { echo 'kubeconfig missing apiVersion'; exit 1; }
 
       - name: Show cluster and nodes
         run: |
