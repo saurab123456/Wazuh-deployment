@@ -1,0 +1,10 @@
+name: Test Runner
+on: workflow_dispatch
+jobs:
+  check:
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
+    steps:
+      - run: |
+          echo "Runner host: $(hostname)"
+          echo "Time: $(date)"
+          kubectl get nodes -o wide
