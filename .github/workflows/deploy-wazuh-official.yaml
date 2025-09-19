@@ -63,9 +63,17 @@ jobs:
       - name: Show cluster and nodes
         run: |
           set -euxo pipefail
+          echo "Context: $(kubectl config current-context || true)"
+          echo "API server: $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' || true)"
           kubectl version --short
-          kubectl config current-context
           kubectl get nodes -o wide
+
+      - name: Runner breadcrumb on Ronin
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /opt/actions-runner/job-logs
+          echo "$(date -Is) job=${GITHUB_JOB} run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} actor=${GITHUB_ACTOR}" \
+            | sudo tee -a /opt/actions-runner/job-logs/wazuh-actions.log
 
       - name: Clone wazuh-kubernetes v4.12.0
         run: |
@@ -80,13 +88,26 @@ jobs:
           set -euxo pipefail
           bash wazuh/certs/indexer_cluster/generate_certs.sh
           bash wazuh/certs/dashboard_http/generate_certs.sh
-          find wazuh/certs -type f | head -n 20
+          echo "Generated cert files (sample):"
+          find wazuh/certs -type f \( -name "*.pem" -o -name "*.key" \) | head -n 20
 
-      - name: Dry run build
+      - name: Dry run build (client-side)
         working-directory: ./wazuh-kubernetes
         run: |
           set -euxo pipefail
           kustomize build envs/local-env | head -n 60
+
+      - name: Ensure wazuh namespace exists
+        run: |
+          set -euxo pipefail
+          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Server dry-run apply (catches RBAC/schema)
+        working-directory: ./wazuh-kubernetes
+        run: |
+          set -euxo pipefail
+          # This contacts the API but does not persist anything.
+          kubectl apply -k envs/local-env/ --dry-run=server
 
       - name: Apply manifests (local-env)
         working-directory: ./wazuh-kubernetes
@@ -134,9 +155,13 @@ jobs:
       - name: Quick status
         run: |
           set -euxo pipefail
+          echo "=== Pods ==="
           kubectl -n "$NS" get pods -o wide || true
+          echo "=== Services ==="
           kubectl -n "$NS" get svc -o wide || true
+          echo "=== PVCs ==="
           kubectl -n "$NS" get pvc -o wide || true
+          echo "=== Deployments/StatefulSets ==="
           kubectl -n "$NS" get statefulsets,deploy -o wide || true
 
       - name: Collect diagnostics
@@ -150,7 +175,7 @@ jobs:
           kubectl -n "$NS" get pvc -o yaml > diag/pvc.yaml 2>&1 || true
           kubectl get storageclass -o yaml > diag/storageclass.yaml 2>&1 || true
           kubectl -n "$NS" get svc -o yaml > diag/svc.yaml 2>&1 || true
-          for pod in $(kubectl -n "$NS" get pods -o name); do
+          for pod in $(kubectl -n "$NS" get pods -o name 2>/dev/null); do
             pn=${pod#pod/}
             kubectl -n "$NS" logs "$pod" --all-containers=true --prefix=true > "diag/logs-${pn}.txt" 2>&1 || true
             kubectl -n "$NS" describe "$pod" > "diag/describe-${pn}.txt" 2>&1 || true
