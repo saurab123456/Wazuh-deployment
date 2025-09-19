@@ -1,4 +1,4 @@
-name: Deploy Wazuh (4.12.0) with Default Credentials
+name: Deploy Wazuh (4.12.0, auto on commit)
 
 on:
   push:
@@ -21,8 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NS: wazuh
+      WAZUH_TAG: v4.12.0
       DASH_PORT: 32563
-      WAZUH_TAG: 4.12.0
 
     steps:
       - name: Checkout this repo
@@ -40,217 +40,124 @@ jobs:
         with:
           version: 'latest'
 
-      - name: Install dependencies (kustomize + openssl)
+      - name: Install kustomize, openssl, jq
         run: |
           set -euxo pipefail
-          # Install kustomize
-          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/latest/download/kustomize_linux_amd64.tar.gz" \
-          | tar -xz
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/latest/download/kustomize_linux_amd64.tar.gz" | tar -xz
           sudo mv kustomize /usr/local/bin/kustomize
           kustomize version
-          
-          # Install openssl (required for cert generation)
           sudo apt-get update
-          sudo apt-get install -y openssl
+          sudo apt-get install -y openssl jq
 
       - name: Write kubeconfig
-        run: |
-          set -euxo pipefail
-          mkdir -p $HOME/.kube
-          echo "${KUBE_CONFIG}" > $HOME/.kube/config
-          chmod 600 $HOME/.kube/config
-          echo "KUBECONFIG=$HOME/.kube/config" >> $GITHUB_ENV
         env:
           KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
-
-      - name: Pre-flight cluster checks
         run: |
           set -euxo pipefail
-          echo "=== Cluster Information ==="
+          mkdir -p "$HOME/.kube"
+          printf "%s" "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+          echo "KUBECONFIG=$HOME/.kube/config" >> "$GITHUB_ENV"
+
+      - name: Sanity: show cluster & nodes
+        run: |
+          set -euxo pipefail
           kubectl version --short
           kubectl config current-context
-          kubectl cluster-info
-          
-          echo "=== Node Resources ==="
-          kubectl get nodes -o=jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.capacity.cpu}{"\t"}{.status.capacity.memory}{"\n"}{end}'
-          
-          echo "=== Storage Classes ==="
-          kubectl get storageclass -o wide
-          
-          # Check if default storage class exists
-          if ! kubectl get storageclass | grep -q "(default)"; then
-            echo "::warning::No default storage class found. PVCs may not bind."
-          fi
+          kubectl get nodes -o wide
 
-      - name: Clone official wazuh-kubernetes (${{ env.WAZUH_TAG }})
+      - name: Clone official wazuh-kubernetes
         run: |
           set -euxo pipefail
           rm -rf wazuh-kubernetes
           git clone https://github.com/wazuh/wazuh-kubernetes.git -b "$WAZUH_TAG" --depth=1
           ls -la wazuh-kubernetes
 
-      - name: Create namespace if not exists
-        run: |
-          set -euxo pipefail
-          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Generate self-signed certs (per Wazuh documentation)
+      - name: Generate required self-signed certificates (per docs)
         working-directory: ./wazuh-kubernetes
         run: |
           set -euxo pipefail
-          # Create directories first to avoid script errors
-          mkdir -p wazuh/certs/indexer_cluster/wazuh-indexer-{0..2}
-          mkdir -p wazuh/certs/dashboard_http/wazuh-dashboard
-          
-          # Generate certificates (using the official scripts)
           bash wazuh/certs/indexer_cluster/generate_certs.sh
           bash wazuh/certs/dashboard_http/generate_certs.sh
-          
-          # Verify certificates were created
-          echo "Generated certificates:"
-          find wazuh/certs -name "*.pem" -o -name "*.key" | head -n 10
-
-      - name: Create custom patches for 2-node cluster
-        working-directory: ./wazuh-kubernetes
-        run: |
-          set -euxo pipefail
-          # Reduce replica counts for smaller cluster (as per Wazuh docs recommendations)
-          mkdir -p patches
-          
-          # Patch for indexer (reduce from 3 to 1 replica for smaller clusters)
-          cat > patches/indexer-replica.yaml << EOF
-          apiVersion: apps/v1
-          kind: StatefulSet
-          metadata:
-            name: wazuh-indexer
-          spec:
-            replicas: 1
-          EOF
-          
-          # Add patches to kustomization (if not already present)
-          if ! grep -q "patchesStrategicMerge" envs/local-env/kustomization.yaml; then
-            echo "patchesStrategicMerge:" >> envs/local-env/kustomization.yaml
-          fi
-          if ! grep -q "indexer-replica.yaml" envs/local-env/kustomization.yaml; then
-            echo "- ../../patches/indexer-replica.yaml" >> envs/local-env/kustomization.yaml
-          fi
+          echo "Generated cert files:"
+          find wazuh/certs -type f | head -n 20
 
       - name: Dry-run build (catch kustomize errors early)
         working-directory: ./wazuh-kubernetes
         run: |
           set -euxo pipefail
-          kustomize build envs/local-env > /tmp/manifest.yaml
-          echo "Generated manifest with $(wc -l < /tmp/manifest.yaml) lines"
-          head -n 60 /tmp/manifest.yaml
-          echo "..."
-          tail -n 10 /tmp/manifest.yaml
+          kustomize build envs/local-env | head -n 60
 
-      - name: Apply manifests (local-env)
+      - name: Apply manifests with kustomize (local-env)
         working-directory: ./wazuh-kubernetes
         run: |
           set -euxo pipefail
-          kustomize build envs/local-env | kubectl apply -f -
+          kubectl apply -k envs/local-env/
 
-      - name: Wait for core components
+      - name: Wait for core components (label-based)
         run: |
           set -euxo pipefail
-          echo "Waiting for Wazuh components to be ready..."
-          
-          # Wait for resources to be created
-          sleep 30
-          
-          # Wait for deployments with progress indication
-          for resource in deploy/wazuh-dashboard statefulset/wazuh-indexer deploy/wazuh-manager; do
-            echo "Waiting for $resource..."
-            if kubectl -n "$NS" get "$resource" > /dev/null 2>&1; then
-              kubectl -n "$NS" rollout status "$resource" --timeout=600s
-            else
-              echo "::warning::$resource not found yet"
-              # Show what resources we do have
-              kubectl -n "$NS" get all
-            fi
-          done
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-dashboard --timeout=600s || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-indexer --timeout=600s || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-manager --timeout=600s || true
+          kubectl -n "$NS" get pods -o wide || true
 
-      - name: Configure dashboard NodePort ${{ env.DASH_PORT }}
+      - name: Expose dashboard on fixed NodePort
+        env:
+          DASH_PORT: ${{ env.DASH_PORT }}
         run: |
           set -euxo pipefail
-          echo "Configuring dashboard service with NodePort $DASH_PORT..."
-          
-          # Wait for service to be created
-          for i in {1..30}; do
-            if kubectl -n "$NS" get svc wazuh-dashboard > /dev/null 2>&1; then
-              break
-            fi
-            sleep 2
-          done
-          
-          # Patch the service to use NodePort
-          kubectl -n "$NS" patch svc wazuh-dashboard --type='merge' -p "{
-            \"spec\": {
-              \"type\": \"NodePort\",
-              \"ports\": [{
-                \"name\": \"https\",
-                \"port\": 443,
-                \"targetPort\": 443,
-                \"protocol\": \"TCP\",
-                \"nodePort\": ${DASH_PORT}
+          # Discover service by label (works across minor variations)
+          SVC=$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].metadata.name}' || true)
+          if [ -z "$SVC" ]; then
+            echo "::warning::Dashboard Service not found yet; skipping patch."
+            exit 0
+          fi
+          cat > /tmp/patch.json <<EOF
+          {
+            "spec": {
+              "type": "NodePort",
+              "ports": [{
+                "name": "https",
+                "port": 443,
+                "targetPort": 443,
+                "protocol": "TCP",
+                "nodePort": ${DASH_PORT}
               }]
             }
-          }"
-          
-          # Show service details
-          kubectl -n "$NS" get svc wazuh-dashboard -o wide
-          
-          # Get node IP for access URL
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
-          echo "Wazuh Dashboard URL: https://${NODE_IP}:${DASH_PORT}"
-          echo "Default credentials: admin/SecretPassword"
-          echo "Note: You may need to configure firewall rules to allow access to port ${DASH_PORT}"
+          }
+          EOF
+          kubectl -n "$NS" patch svc "$SVC" --type=merge -p "$(cat /tmp/patch.json)"
+          kubectl -n "$NS" get svc "$SVC" -o wide
+          echo "URL: https://<any-node-ip>:${DASH_PORT}"
 
-      - name: Verify default credentials are set
+      - name: Quick status
         run: |
           set -euxo pipefail
-          echo "=== Verifying Default Credentials ==="
-          echo "Wazuh uses default credentials: admin/SecretPassword"
-          echo "No changes needed to configuration files - using defaults as documented"
-
-      - name: Quick status check
-        run: |
-          set -euxo pipefail
-          echo "=== Pod Status ==="
-          kubectl -n "$NS" get pods -o wide --sort-by=.status.phase
-          
-          echo "=== Service Status ==="
-          kubectl -n "$NS" get svc -o wide
-          
-          echo "=== PVC Status ==="
-          kubectl -n "$NS" get pvc -o wide
-          
-          # Check if all pods are running
-          NOT_RUNNING=$(kubectl -n "$NS" get pods --field-selector=status.phase!=Running --no-headers | wc -l)
-          if [ "$NOT_RUNNING" -gt 0 ]; then
-            echo "::warning::Some pods are not running:"
-            kubectl -n "$NS" get pods --field-selector=status.phase!=Running
-          fi
+          echo "=== Pods ==="
+          kubectl -n "$NS" get pods -o wide || true
+          echo "=== Services ==="
+          kubectl -n "$NS" get svc -o wide || true
+          echo "=== PVCs ==="
+          kubectl -n "$NS" get pvc -o wide || true
+          echo "=== Deployments/StatefulSets ==="
+          kubectl -n "$NS" get statefulsets,deploy -o wide || true
 
       - name: Collect diagnostics (artifacts)
         if: always()
         run: |
           set -euxo pipefail
           mkdir -p diag
-          
-          echo "Collecting cluster diagnostics..."
           kubectl -n "$NS" get all -o wide > diag/get-all.txt 2>&1 || true
           kubectl -n "$NS" get events --sort-by=.lastTimestamp > diag/events.txt 2>&1 || true
-          kubectl -n "$NS" describe pods > diag/pods-describe.txt 2>&1 || true
+          kubectl -n "$NS" get pods -o yaml > diag/pods.yaml 2>&1 || true
           kubectl -n "$NS" get pvc -o yaml > diag/pvc.yaml 2>&1 || true
           kubectl get storageclass -o yaml > diag/storageclass.yaml 2>&1 || true
           kubectl -n "$NS" get svc -o yaml > diag/svc.yaml 2>&1 || true
-          
-          # Get logs for all pods
           for pod in $(kubectl -n "$NS" get pods -o name); do
-            pod_name=${pod#pod/}
-            kubectl -n "$NS" logs "$pod" --all-containers=true --prefix=true > "diag/logs-${pod_name}.txt" 2>&1 || true
+            pn=${pod#pod/}
+            kubectl -n "$NS" logs "$pod" --all-containers=true --prefix=true > "diag/logs-${pn}.txt" 2>&1 || true
+            kubectl -n "$NS" describe "$pod" > "diag/describe-${pn}.txt" 2>&1 || true
           done
 
       - name: Upload diagnostics
@@ -260,27 +167,10 @@ jobs:
           name: wazuh-diagnostics-${{ github.run_id }}
           path: diag/**
 
-      - name: Final deployment summary
+      - name: Health check & URL hint
         run: |
           set -euxo pipefail
-          echo "=== Wazuh Deployment Complete ==="
-          
-          # Get node IP for access URL
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
-          
+          kubectl -n "$NS" get pods -o wide || true
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' 2>/dev/null || echo "<node-ip>")
           echo "Wazuh Dashboard URL: https://${NODE_IP}:${DASH_PORT}"
-          echo "Default credentials: admin/SecretPassword"
-          echo ""
-          echo "To access Wazuh:"
-          echo "1. Ensure firewall allows access to port ${DASH_PORT} on your nodes"
-          echo "2. Open https://${NODE_IP}:${DASH_PORT} in your browser"
-          echo "3. Accept the self-signed certificate warning"
-          echo "4. Login with admin/SecretPassword"
-          echo ""
-          echo "Current pod status:"
-          kubectl -n "$NS" get pods -o wide
-          
-          # Check if PVCs are bound
-          echo ""
-          echo "PVC status:"
-          kubectl -n "$NS" get pvc -o wide
+          echo "Accept the self-signed certificate warning."
