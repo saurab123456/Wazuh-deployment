@@ -1,0 +1,95 @@
+name: Deploy Wazuh (Official 4.12.0 with NodePort 32563)
+
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "Kustomize env (eks or local-env)"
+        required: true
+        default: "local-env"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Setup kustomize
+        run: |
+          curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/latest/download/kustomize_linux_amd64.tar.gz" \
+          | tar -xz && sudo mv kustomize /usr/local/bin/kustomize
+
+      - name: Write kubeconfig
+        run: |
+          echo "${KUBE_CONFIG}" > $HOME/kubeconfig
+          chmod 600 $HOME/kubeconfig
+          echo "KUBECONFIG=$HOME/kubeconfig" >> $GITHUB_ENV
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Clone official wazuh-kubernetes (v4.12.0)
+        run: |
+          git clone https://github.com/wazuh/wazuh-kubernetes.git -b v4.12.0 --depth=1
+
+      - name: Generate self-signed certs
+        working-directory: ./wazuh-kubernetes
+        run: |
+          bash wazuh/certs/indexer_cluster/generate_certs.sh
+          bash wazuh/certs/dashboard_http/generate_certs.sh
+
+      - name: Apply manifests with kustomize
+        working-directory: ./wazuh-kubernetes
+        run: |
+          if [ "${ENVSEL}" = "eks" ]; then
+            kubectl apply -k envs/eks/
+          else
+            kubectl apply -k envs/local-env/
+          fi
+        env:
+          ENVSEL: ${{ github.event.inputs.env }}
+
+      # --- NEW: Force dashboard Service to NodePort 32563 ---
+      - name: Expose dashboard on fixed NodePort 32563
+        run: |
+          NS="wazuh"
+          SVC="dashboard"
+          PORT=32563
+
+          # Wait until the Service exists (in case the API is a little slow)
+          for i in $(seq 1 30); do
+            if kubectl -n "$NS" get svc "$SVC" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 3
+          done
+
+          # Patch the service to NodePort 32563 (idempotent)
+          kubectl -n "$NS" patch svc "$SVC" --type='merge' -p "{
+            \"spec\": {
+              \"type\": \"NodePort\",
+              \"ports\": [{
+                \"name\": \"https\",
+                \"port\": 443,
+                \"targetPort\": 443,
+                \"protocol\": \"TCP\",
+                \"nodePort\": ${PORT}
+              }]
+            }
+          }"
+
+          echo "Dashboard exposed at https://<node-ip>:${PORT}"
+
+      - name: Show objects and URL hint
+        run: |
+          kubectl -n wazuh get pods -o wide
+          kubectl -n wazuh get svc dashboard -o wide
+          echo ""
+          echo "Open: https://<any-node-ip>:32563"
+          echo "Login with default credentials (unchanged)."
