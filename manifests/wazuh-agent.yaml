@@ -80,7 +80,6 @@ spec:
 
       containers:
         - name: wazuh-agent
-          # Use YOUR pushed image. Change tag if you published a different one.
           image: ghcr.io/saurab123456/wazuh-agent:4.12.0
           imagePullPolicy: IfNotPresent
           securityContext:
@@ -95,8 +94,6 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
-            - name: AGENT_NAME
-              value: "$(NODE_NAME)-$(POD_NAME)"
             - name: AUTHD_PORT
               value: "1515"
             - name: MANAGER_DNS
@@ -106,15 +103,22 @@ spec:
           command: ["/bin/sh","-c"]
           args: |
             set -e
+            # Build AGENT_NAME from downward API vars
+            AGENT_NAME="${NODE_NAME}-${POD_NAME}"
+            echo "Agent name: ${AGENT_NAME}"
+
+            # Prep dirs and config
             mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
             cp /config/ossec.conf /var/ossec/etc/ossec.conf
             rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
 
+            # Enroll if needed
             if [ ! -s /var/ossec/etc/client.keys ]; then
               echo "No client keys found, enrolling to ${MANAGER_DNS}:${AUTHD_PORT}…"
               /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" || echo "Enrollment finished (duplicates ok)"
             fi
 
+            # Start agent and follow logs
             echo "Starting Wazuh agent…"
             /var/ossec/bin/wazuh-control start
             sleep 5
@@ -138,6 +142,10 @@ spec:
             periodSeconds: 30
             failureThreshold: 3
             timeoutSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh","-c","/var/ossec/bin/wazuh-control stop || true"]
           resources:
             requests:
               cpu: "100m"
