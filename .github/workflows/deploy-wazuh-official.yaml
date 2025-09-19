@@ -49,7 +49,7 @@ jobs:
           sudo chmod +x /usr/local/bin/yq
           yq --version
 
-      # --- kubeconfig from base64 (authoritative) ---
+      # kubeconfig from base64 (authoritative)
       - name: Write kubeconfig
         env:
           KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
@@ -78,7 +78,7 @@ jobs:
           echo "$(date -Is) job=${GITHUB_JOB} run=${GITHUB_RUN_ID} sha=${GITHUB_SHA} actor=${GITHUB_ACTOR}" \
             | sudo tee -a /opt/actions-runner/job-logs/wazuh-actions.log
 
-      - name: Clone wazuh-kubernetes v4.12.0
+      - name: Clone wazuh-kubernetes ${{ env.WAZUH_TAG }}
         run: |
           set -euxo pipefail
           rm -rf wazuh-kubernetes
@@ -99,50 +99,67 @@ jobs:
           set -euxo pipefail
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # --- Improved StorageClass configuration ---
-      - name: Ensure 'wazuh-storage' StorageClass (alias of default)
+      # Make wazuh-storage an alias of a DYNAMIC provisioner (prefers rancher local-path)
+      - name: Ensure 'wazuh-storage' StorageClass (alias of dynamic provisioner)
         run: |
           set -euxo pipefail
-          # Get the correct default StorageClass provisioner using JSON parsing
-          DEF_SC=$(kubectl get storageclass -o json | jq -r '.items[] | select(.metadata.annotations."storageclass.kubernetes.io/is-default-class" == "true") | .metadata.name' | head -n1)
-          
-          if [ -z "$DEF_SC" ]; then
-            DEF_SC=$(kubectl get storageclass -o jsonpath='{.items[0].metadata.name}')
+          # Prefer rancher local-path if present
+          if kubectl get sc local-path >/dev/null 2>&1; then
+            TARGET_SC="local-path"
+          else
+            # pick a default SC that is NOT 'kubernetes.io/no-provisioner'
+            TARGET_SC=$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\t"}{.provisioner}{"\n"}{end}' \
+              | awk '$2=="true" && $3!="kubernetes.io/no-provisioner"{print $1}' | head -n1)
+            # fallback: first SC that isn’t no-provisioner
+            if [ -z "${TARGET_SC}" ]; then
+              TARGET_SC=$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.provisioner}{"\n"}{end}' \
+                | awk '$2!="kubernetes.io/no-provisioner"{print $1}' | head -n1)
+            fi
           fi
-          
-          echo "Default StorageClass: ${DEF_SC}"
-          DEF_PROV=$(kubectl get sc "$DEF_SC" -o jsonpath='{.provisioner}')
-          echo "Default provisioner: ${DEF_PROV}"
 
-          # Delete existing wazuh-storage if it exists
-          kubectl delete sc wazuh-storage --ignore-not-found
+          if [ -z "${TARGET_SC:-}" ]; then
+            echo "::error::No dynamic StorageClass found (local-path or other). Install a dynamic provisioner."
+            exit 1
+          fi
 
-          # Create correct wazuh-storage StorageClass
-          cat > /tmp/wazuh-storage.yaml <<EOF
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: wazuh-storage
-provisioner: ${DEF_PROV}
-reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer
-allowVolumeExpansion: true
-EOF
-          kubectl apply -f /tmp/wazuh-storage.yaml
+          TARGET_PROV=$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')
+          echo "Using dynamic SC '${TARGET_SC}' with provisioner '${TARGET_PROV}' for wazuh-storage"
+
+          # If wazuh-storage exists with a different provisioner, replace it cleanly
+          if kubectl get sc wazuh-storage >/dev/null 2>&1; then
+            CUR_PROV=$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}')
+            if [ "$CUR_PROV" != "$TARGET_PROV" ]; then
+              kubectl delete sc wazuh-storage
+            fi
+          fi
+
+          if ! kubectl get sc wazuh-storage >/dev/null 2>&1; then
+            cat > /tmp/wazuh-storage.yaml <<EOF
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: wazuh-storage
+          provisioner: ${TARGET_PROV}
+          reclaimPolicy: Delete
+          volumeBindingMode: WaitForFirstConsumer
+          allowVolumeExpansion: true
+          EOF
+            kubectl apply -f /tmp/wazuh-storage.yaml
+          fi
+
           kubectl get storageclass -o wide
 
-      # --- Build manifests and drop any StorageClass resources to avoid immutability conflicts ---
+      # Build manifests and drop any StorageClass objects to avoid immutability conflicts
       - name: Build manifests (strip StorageClass)
         working-directory: ./wazuh-kubernetes
         run: |
           set -euxo pipefail
           kubectl kustomize envs/local-env > /tmp/wazuh-all.yaml
-          # Remove any StorageClass objects from upstream
           yq 'select(.kind != "StorageClass")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sc.yaml
           echo "First docs after filtering:"
           head -n 80 /tmp/wazuh-no-sc.yaml || true
 
-      - name: Server dry-run apply (catches RBAC/schema)
+      - name: Server dry-run apply (validate)
         run: |
           set -euxo pipefail
           kubectl apply -f /tmp/wazuh-no-sc.yaml --dry-run=server
@@ -152,26 +169,42 @@ EOF
           set -euxo pipefail
           kubectl apply -f /tmp/wazuh-no-sc.yaml
 
-      - name: Clean up stuck resources if needed
+      - name: Wait for PVCs to bind (initial)
         run: |
           set -euxo pipefail
-          # Delete any stuck PVCs that might be preventing new ones from binding
-          if kubectl -n "$NS" get pvc --no-headers 2>/dev/null | grep -q Pending; then
-            echo "Deleting stuck PVCs..."
-            kubectl -n "$NS" delete pvc --all
-            sleep 10
-          fi
-
-      - name: Wait for PVCs to bind (wazuh namespace)
-        run: |
-          set -euxo pipefail
-          echo "Waiting for PVCs to be created..."
-          sleep 30
           if kubectl -n "$NS" get pvc --no-headers 2>/dev/null | grep -q .; then
-            echo "Waiting for all PVCs in namespace '$NS' to be Bound..."
-            timeout 600 bash -c 'until [ -z "$(kubectl -n '"$NS"' get pvc --no-headers | awk '"'"'{print $2}'"'"' | grep -v Bound)" ]; do kubectl -n '"$NS"' get pvc; sleep 10; done'
+            echo "Waiting up to 5 minutes for all PVCs in '$NS' to be Bound..."
+            timeout 300 bash -c 'until [ -z "$(kubectl -n '"$NS"' get pvc --no-headers | awk '"'"'{print $2}'"'"' | grep -v Bound)" ]; do kubectl -n '"$NS"' get pvc; sleep 5; done' || true
           else
             echo "No PVCs found (yet)."
+          fi
+          kubectl -n "$NS" get pvc -o wide || true
+
+      # Auto-recover stuck PVCs (scale down, delete only unbound PVCs, scale up)
+      - name: Auto-recover unbound PVCs
+        run: |
+          set -euxo pipefail
+          UNBOUND=$(kubectl -n "$NS" get pvc -o json | jq -r '.items[] | select(.status.phase!="Bound") | .metadata.name' || true)
+          if [ -n "$UNBOUND" ]; then
+            echo "Unbound PVCs detected: $UNBOUND"
+            kubectl -n "$NS" scale statefulset wazuh-indexer --replicas=0 || true
+            kubectl -n "$NS" scale statefulset wazuh-manager-master --replicas=0 || true
+            kubectl -n "$NS" scale statefulset wazuh-manager-worker --replicas=0 || true
+            echo "$UNBOUND" | xargs -r -n1 kubectl -n "$NS" delete pvc --ignore-not-found
+            sleep 5
+            kubectl -n "$NS" scale statefulset wazuh-indexer --replicas=1 || true
+            kubectl -n "$NS" scale statefulset wazuh-manager-master --replicas=1 || true
+            kubectl -n "$NS" scale statefulset wazuh-manager-worker --replicas=1 || true
+          else
+            echo "No unbound PVCs to recover."
+          fi
+
+      - name: Wait for PVCs to bind (post-recovery)
+        run: |
+          set -euxo pipefail
+          if kubectl -n "$NS" get pvc --no-headers 2>/dev/null | grep -q .; then
+            echo "Waiting up to 5 minutes for all PVCs (post-recovery) to be Bound..."
+            timeout 300 bash -c 'until [ -z "$(kubectl -n '"$NS"' get pvc --no-headers | awk '"'"'{print $2}'"'"' | grep -v Bound)" ]; do kubectl -n '"$NS"' get pvc; sleep 5; done' || true
           fi
           kubectl -n "$NS" get pvc -o wide || true
 
