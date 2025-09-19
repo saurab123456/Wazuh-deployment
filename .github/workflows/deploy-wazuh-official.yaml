@@ -63,7 +63,6 @@ jobs:
 
           echo "First 5 lines of kubeconfig (sanity):"
           head -n 5 "$out" || true
-          # Let kubectl parse it; fail early if invalid
           kubectl --kubeconfig="$out" config get-contexts >/dev/null
 
       - name: Show cluster and nodes
@@ -71,7 +70,6 @@ jobs:
           set -euxo pipefail
           echo "Context: $(kubectl config current-context || true)"
           echo "API server: $(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' || true)"
-          # Portable client version output (no --short)
           kubectl version --client=true -o yaml || kubectl version --client=true || true
           kubectl get nodes -o wide
 
@@ -108,6 +106,24 @@ jobs:
         run: |
           set -euxo pipefail
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      # --- NEW: Ensure default StorageClass so PVCs bind ---
+      - name: Ensure default StorageClass exists
+        run: |
+          set -euxo pipefail
+          cat > /tmp/storageclass-hostpath.yaml <<'EOF'
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: local-hostpath
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: kubernetes.io/no-provisioner
+          volumeBindingMode: WaitForFirstConsumer
+          EOF
+          kubectl apply -f /tmp/storageclass-hostpath.yaml
+          echo "StorageClasses available:"
+          kubectl get storageclass
 
       - name: Server dry-run apply (catches RBAC/schema)
         working-directory: ./wazuh-kubernetes
