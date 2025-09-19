@@ -28,45 +28,28 @@ jobs:
         run: |
           set -euo pipefail
           curl -fsSL -o kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/kubectl
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
           kubectl version --client --output=yaml
 
       - name: Write kubeconfig from secret
         shell: bash
         env:
+          # Make sure this exact repo secret exists
           KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
           set -euo pipefail
-          test -n "$KUBE_CONFIG_B64"
+          test -n "${KUBE_CONFIG_B64:-}"
           mkdir -p "$HOME/.kube"
           echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
-          kubectl config current-context
-
-      # OPTIONAL: only needed if your GHCR image is private and you set these secrets.
-      - name: Create/Update GHCR pull secret (ghcr-cred)
-        if: ${{ secrets.GHCR_USERNAME != '' && secrets.GHCR_PAT != '' }}
-        shell: bash
-        env:
-          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
-          GHCR_PAT: ${{ secrets.GHCR_PAT }}
-        run: |
-          set -euo pipefail
-          kubectl create namespace wazuh --dry-run=client -o yaml | kubectl apply -f -
-          kubectl -n wazuh create secret docker-registry ghcr-cred \
-            --docker-server=ghcr.io \
-            --docker-username="$GHCR_USERNAME" \
-            --docker-password="$GHCR_PAT" \
-            --docker-email=unused@example.com \
-            -o yaml --dry-run=client | kubectl apply -f -
+          echo "Current context: $(kubectl config current-context)"
+          echo "Cluster nodes:"; kubectl get nodes -o wide
 
       - name: Apply Wazuh Agent manifest
         shell: bash
         run: |
           set -euo pipefail
-          # Assumes your manifest is at manifests/wazuh-agent.yaml
-          # (and uses ghcr.io/<OWNER>/wazuh-agent:4.12.0 or whatever you pushed)
           kubectl apply -f manifests/wazuh-agent.yaml
           kubectl -n wazuh rollout status ds/wazuh-agent --timeout=300s || true
+          kubectl -n wazuh get ds/wazuh-agent
           kubectl -n wazuh get pods -l app=wazuh-agent -o wide || true
