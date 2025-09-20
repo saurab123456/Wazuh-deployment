@@ -23,7 +23,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # No sudo; install kubectl into a writable dir and add to PATH
+      # Install kubectl without sudo into a writable PATH
       - name: Ensure kubectl is available (no sudo)
         shell: bash
         run: |
@@ -52,17 +52,16 @@ jobs:
           echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
           echo "Current context: $(kubectl config current-context || true)"
-          echo "Cluster nodes:"
-          kubectl get nodes -o wide
+          echo "Cluster nodes:"; kubectl get nodes -o wide
 
-      # Create/Update CM + DaemonSet (public image; no imagePullSecrets)
       - name: Deploy Wazuh Agent
         shell: bash
         run: |
           set -euo pipefail
           NS="wazuh"
           IMAGE="ghcr.io/saurab123456/wazuh-agent:4.12.0"
-          MANAGER_DNS="wazuh.wazuh.svc.cluster.local"
+          # Use the workers Service for remoted (1514)
+          MANAGER_DNS="wazuh-workers.wazuh.svc.cluster.local"
           AUTHD_PORT="1515"
 
           echo "==> Ensuring namespace ${NS}"
@@ -79,21 +78,28 @@ jobs:
               <ossec_config>
                 <client>
                   <server>
-                    <address>wazuh.wazuh.svc.cluster.local</address>
+                    <!-- send events to workers service (1514/tcp) -->
+                    <address>wazuh-workers.wazuh.svc.cluster.local</address>
                     <port>1514</port>
                     <protocol>tcp</protocol>
                   </server>
                 </client>
+
+                <!-- CRI/container logs -->
                 <localfile>
                   <location>/host/var/log/containers/*.log</location>
                   <log_format>syslog</log_format>
                   <only-future-events>yes</only-future-events>
                 </localfile>
+
+                <!-- Pod logs -->
                 <localfile>
                   <location>/host/var/log/pods/*/*/*.log</location>
                   <log_format>syslog</log_format>
                   <only-future-events>yes</only-future-events>
                 </localfile>
+
+                <!-- Optional node syslog -->
                 <localfile>
                   <location>/host/var/log/syslog</location>
                   <log_format>syslog</log_format>
@@ -103,8 +109,7 @@ jobs:
           YAML
 
           echo "==> Apply DaemonSet"
-          # NOTE: heredoc is unquoted so ${IMAGE} expands on the runner.
-          # All pod-side variables are escaped like \$NODE_NAME so they expand INSIDE the container, not here.
+          # Unquoted heredoc to allow env expansion on the runner.
           cat <<YAML | kubectl -n "${NS}" apply -f -
           apiVersion: apps/v1
           kind: DaemonSet
@@ -145,7 +150,8 @@ jobs:
                     args:
                       - |
                         set -e
-                        AGENT_NAME="\$NODE_NAME-\$POD_NAME"
+                        # Use a stable identity per node to avoid agent duplicates
+                        AGENT_NAME="\$NODE_NAME"
                         echo "Agent name: \$AGENT_NAME"
 
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
@@ -206,4 +212,4 @@ jobs:
           echo "==> Wait for DaemonSet rollout"
           kubectl -n "${NS}" rollout status ds/wazuh-agent --timeout=300s || true
           echo "==> Pods"
-          kubectl -n "${NS}" get pods -l app=wazuh-agent -o wide
+          kubectl -n "${NS}" get pods -l app=wazuh-agent -o wide || true
