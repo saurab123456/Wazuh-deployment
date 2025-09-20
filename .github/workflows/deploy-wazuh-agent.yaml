@@ -23,12 +23,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install kubectl
+      # No sudo; install kubectl into a writable dir and add to PATH
+      - name: Ensure kubectl is available (no sudo)
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v kubectl >/dev/null 2>&1; then
+            echo "Installing kubectl to \$HOME/.local/bin"
+            curl -fsSL -o "$HOME/.local/bin/kubectl" "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x "$HOME/.local/bin/kubectl"
+          else
+            echo "kubectl already present: $(command -v kubectl)"
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           kubectl version --client --output=yaml
 
       - name: Write kubeconfig from secret
@@ -37,30 +45,30 @@ jobs:
           KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
           set -euo pipefail
-          test -n "${KUBE_CONFIG_B64:-}"
+          if [ -z "${KUBE_CONFIG_B64:-}" ]; then
+            echo "::error::Missing repo secret KUBE_CONFIG_B64"; exit 1
+          fi
           mkdir -p "$HOME/.kube"
           echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
-          echo "Current context: $(kubectl config current-context)"
-          echo "Cluster nodes:"; kubectl get nodes -o wide
+          echo "Current context: $(kubectl config current-context || true)"
+          echo "Cluster nodes:"
+          kubectl get nodes -o wide
 
-      - name: Deploy Wazuh Agent (inline bash)
+      # Call your bash to create CM + DaemonSet (public image; no imagePullSecrets)
+      - name: Deploy Wazuh Agent
         shell: bash
         run: |
-          # your entire script, exactly as you pasted:
-          #!/usr/bin/env bash
           set -euo pipefail
-
           NS="wazuh"
           IMAGE="ghcr.io/saurab123456/wazuh-agent:4.12.0"
           MANAGER_DNS="wazuh.wazuh.svc.cluster.local"
           AUTHD_PORT="1515"
 
-          echo "==> Using kubectl context: $(kubectl config current-context)"
           echo "==> Ensuring namespace ${NS}"
           kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
 
-          echo "==> Creating/Updating ossec.conf ConfigMap"
+          echo "==> Apply ossec.conf ConfigMap"
           kubectl -n "${NS}" apply -f - <<'YAML'
           apiVersion: v1
           kind: ConfigMap
@@ -94,7 +102,7 @@ jobs:
               </ossec_config>
           YAML
 
-          echo "==> Deploying Wazuh Agent DaemonSet (public image; no imagePullSecrets)"
+          echo "==> Apply DaemonSet"
           cat <<YAML | kubectl -n "${NS}" apply -f -
           apiVersion: apps/v1
           kind: DaemonSet
@@ -190,8 +198,7 @@ jobs:
                     hostPath: { path: /var/log,            type: Directory }
           YAML
 
-          echo "==> Waiting for DaemonSet rollout"
+          echo "==> Wait for DaemonSet rollout"
           kubectl -n "${NS}" rollout status ds/wazuh-agent --timeout=300s || true
-          echo "==> Current DaemonSet & Pods"
-          kubectl -n "${NS}" get ds/wazuh-agent
+          echo "==> Pods"
           kubectl -n "${NS}" get pods -l app=wazuh-agent -o wide
