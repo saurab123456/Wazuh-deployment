@@ -23,7 +23,7 @@ jobs:
       NS: wazuh
       IMAGE: ghcr.io/saurab123456/wazuh-agent:4.12.0
       AUTHD_PORT: "1515"   # manager authd
-      EVENTS_PORT: "1514"  # remoted/events on workers
+      EVENTS_PORT: "1514"  # remoted/events
 
     steps:
       - name: Checkout
@@ -81,7 +81,6 @@ jobs:
             echo "Found worker pod: $WPOD"
           fi
 
-      # ✅ FIX: stream script via stdin instead of nested quotes (this avoids YAML quoting issues)
       - name: Patch manager config (passwordless authd 1515 + remoted 1514)
         shell: bash
         run: |
@@ -91,7 +90,7 @@ jobs:
           CONF=/var/ossec/etc/ossec.conf
           cp -f "$CONF" "${CONF}.bak.$(date +%s)"
 
-          # Ensure <auth> exists (1515, no password, force 0s timers)
+          # Ensure <auth> exists (1515, no password, zero force timers)
           if ! grep -q "<auth>" "$CONF"; then
             awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_source_ip>no</use_source_ip>\\n    <force>\\n      <enabled>yes</enabled>\\n      <key_mismatch>yes</key_mismatch>\\n      <disconnected_time enabled=\\\"yes\\\">0s</disconnected_time>\\n      <after_registration_time>0s</after_registration_time>\\n    </force>\\n    <purge>no</purge>\\n    <use_password>no</use_password>\\n    <ssl_verify_host>no</ssl_verify_host>\\n    <ssl_auto_negotiate>yes</ssl_auto_negotiate>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
           fi
@@ -128,7 +127,6 @@ jobs:
           /var/ossec/bin/wazuh-control restart || true
           EOS
 
-          # Show that manager is listening on 1515 and 1514
           kubectl -n "$NS" logs "$MASTER_POD" --tail=200 | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" || true
 
       - name: Ensure shared group 'kubernetes' and permissions
@@ -211,7 +209,8 @@ jobs:
               <ossec_config>
                 <client>
                   <server>
-                    <address>wazuh-workers.wazuh.svc.cluster.local</address>
+                    <!-- Send events to MASTER first to avoid Invalid ID during enrollment -->
+                    <address>wazuh.wazuh.svc.cluster.local</address>
                     <port>1514</port>
                     <protocol>tcp</protocol>
                   </server>
@@ -276,30 +275,50 @@ jobs:
                       - name: AUTHD_PORT
                         value: "${AUTHD_PORT}"
                       - name: MANAGER_DNS
-                        value: "wazuh.wazuh.svc.cluster.local"
+                        value: "wazuh.wazuh.svc.cluster.local"   # enroll to MASTER
                       - name: GROUPS
                         value: "kubernetes"
                     command: ["/bin/sh","-c"]
                     args:
                       - |
                         set -e
-                        AGENT_NAME="$NODE_NAME"
-                        echo "Agent name: $AGENT_NAME"
+                        AGENT_NAME="\$NODE_NAME"
+                        echo "Agent name: \$AGENT_NAME"
+
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+
+                        enroll() {
+                          echo "Enrolling to \$MANAGER_DNS:\$AUTHD_PORT (group=\$GROUPS)…"
+                          if [ -n "\$GROUPS" ]; then
+                            /var/ossec/bin/agent-auth -m "\$MANAGER_DNS" -p "\$AUTHD_PORT" -A "\$AGENT_NAME" -G "\$GROUPS"
+                          else
+                            /var/ossec/bin/agent-auth -m "\$MANAGER_DNS" -p "\$AUTHD_PORT" -A "\$AGENT_NAME"
+                          fi
+                        }
+
+                        # Retry enrollment up to 12 times (~2 minutes)
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          echo "Enrolling to $MANAGER_DNS:$AUTHD_PORT (group=$GROUPS)…"
-                          /var/ossec/bin/agent-auth -m "$MANAGER_DNS" -p "$AUTHD_PORT" -A "$AGENT_NAME" -G "$GROUPS" || true
+                          for i in \$(seq 1 12); do
+                            if enroll; then
+                              break
+                            fi
+                            echo "Enroll attempt \$i failed; retrying in 10s…"
+                            sleep 10
+                          done
                         fi
-                        /var/ossec/bin/wazuh-control start
-                        sleep 5
-                        if /var/ossec/bin/wazuh-control status | grep -q "is running"; then
-                          tail -f /var/ossec/logs/ossec.log
-                        else
-                          /var/ossec/bin/wazuh-control status || true
+
+                        if [ ! -s /var/ossec/etc/client.keys ]; then
+                          echo "ERROR: Enrollment failed; exiting."
                           exit 1
                         fi
+
+                        echo "Starting Wazuh agent…"
+                        /var/ossec/bin/wazuh-control start
+                        sleep 5
+                        /var/ossec/bin/wazuh-control status
+                        tail -f /var/ossec/logs/ossec.log
                     readinessProbe:
                       exec:
                         command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"']
