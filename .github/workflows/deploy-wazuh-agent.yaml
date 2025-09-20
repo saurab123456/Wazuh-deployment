@@ -34,7 +34,6 @@ jobs:
       - name: Write kubeconfig from secret
         shell: bash
         env:
-          # Make sure this exact repo secret exists
           KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
           set -euo pipefail
@@ -45,11 +44,154 @@ jobs:
           echo "Current context: $(kubectl config current-context)"
           echo "Cluster nodes:"; kubectl get nodes -o wide
 
-      - name: Apply Wazuh Agent manifest
+      - name: Deploy Wazuh Agent (inline bash)
         shell: bash
         run: |
+          # your entire script, exactly as you pasted:
+          #!/usr/bin/env bash
           set -euo pipefail
-          kubectl apply -f manifests/wazuh-agent.yaml
-          kubectl -n wazuh rollout status ds/wazuh-agent --timeout=300s || true
-          kubectl -n wazuh get ds/wazuh-agent
-          kubectl -n wazuh get pods -l app=wazuh-agent -o wide || true
+
+          NS="wazuh"
+          IMAGE="ghcr.io/saurab123456/wazuh-agent:4.12.0"
+          MANAGER_DNS="wazuh.wazuh.svc.cluster.local"
+          AUTHD_PORT="1515"
+
+          echo "==> Using kubectl context: $(kubectl config current-context)"
+          echo "==> Ensuring namespace ${NS}"
+          kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
+
+          echo "==> Creating/Updating ossec.conf ConfigMap"
+          kubectl -n "${NS}" apply -f - <<'YAML'
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: wazuh-agent-ossec
+          data:
+            ossec.conf: |
+              <ossec_config>
+                <client>
+                  <server>
+                    <address>wazuh.wazuh.svc.cluster.local</address>
+                    <port>1514</port>
+                    <protocol>tcp</protocol>
+                  </server>
+                </client>
+                <localfile>
+                  <location>/host/var/log/containers/*.log</location>
+                  <log_format>syslog</log_format>
+                  <only-future-events>yes</only-future-events>
+                </localfile>
+                <localfile>
+                  <location>/host/var/log/pods/*/*/*.log</location>
+                  <log_format>syslog</log_format>
+                  <only-future-events>yes</only-future-events>
+                </localfile>
+                <localfile>
+                  <location>/host/var/log/syslog</location>
+                  <log_format>syslog</log_format>
+                  <only-future-events>yes</only-future-events>
+                </localfile>
+              </ossec_config>
+          YAML
+
+          echo "==> Deploying Wazuh Agent DaemonSet (public image; no imagePullSecrets)"
+          cat <<YAML | kubectl -n "${NS}" apply -f -
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: wazuh-agent
+            labels: { app: wazuh-agent }
+          spec:
+            selector: { matchLabels: { app: wazuh-agent } }
+            updateStrategy: { type: RollingUpdate }
+            template:
+              metadata:
+                labels: { app: wazuh-agent }
+              spec:
+                hostNetwork: true
+                hostPID: true
+                dnsPolicy: ClusterFirstWithHostNet
+                terminationGracePeriodSeconds: 30
+                tolerations:
+                  - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
+                  - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+                containers:
+                  - name: wazuh-agent
+                    image: ${IMAGE}
+                    imagePullPolicy: IfNotPresent
+                    securityContext: { privileged: true, runAsUser: 0 }
+                    env:
+                      - name: NODE_NAME
+                        valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+                      - name: POD_NAME
+                        valueFrom: { fieldRef: { fieldPath: metadata.name } }
+                      - name: AUTHD_PORT
+                        value: "${AUTHD_PORT}"
+                      - name: MANAGER_DNS
+                        value: "${MANAGER_DNS}"
+                      - name: GROUPS
+                        value: "kubernetes"
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        AGENT_NAME="${NODE_NAME}-${POD_NAME}"
+                        echo "Agent name: ${AGENT_NAME}"
+                        mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
+                        cp /config/ossec.conf /var/ossec/etc/ossec.conf
+                        rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+                        if [ ! -s /var/ossec/etc/client.keys ]; then
+                          echo "No client keys found, enrolling to ${MANAGER_DNS}:${AUTHD_PORT}…"
+                          /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" || echo "Enrollment finished (duplicates ok)"
+                        fi
+                        echo "Starting Wazuh agent…"
+                        /var/ossec/bin/wazuh-control start
+                        sleep 5
+                        if /var/ossec/bin/wazuh-control status | grep -q "is running"; then
+                          tail -f /var/ossec/logs/ossec.log
+                        else
+                          /var/ossec/bin/wazuh-control status || true
+                          exit 1
+                        fi
+                    readinessProbe:
+                      exec:
+                        command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"']
+                      initialDelaySeconds: 30
+                      periodSeconds: 10
+                      failureThreshold: 6
+                      timeoutSeconds: 5
+                    livenessProbe:
+                      exec:
+                        command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"']
+                      initialDelaySeconds: 60
+                      periodSeconds: 30
+                      failureThreshold: 3
+                      timeoutSeconds: 5
+                    lifecycle:
+                      preStop:
+                        exec:
+                          command: ["/bin/sh","-c","/var/ossec/bin/wazuh-control stop || true"]
+                    resources:
+                      requests: { cpu: "100m", memory: "256Mi" }
+                      limits:   { cpu: "1000m", memory: "1024Mi" }
+                    volumeMounts:
+                      - { name: ossec-conf-cm, mountPath: /config, readOnly: true }
+                      - { name: varlogcontainers, mountPath: /host/var/log/containers, readOnly: true }
+                      - { name: varlogpods,       mountPath: /host/var/log/pods,       readOnly: true }
+                      - { name: varlog,           mountPath: /host/var/log,            readOnly: true }
+                volumes:
+                  - name: ossec-conf-cm
+                    configMap: { name: wazuh-agent-ossec }
+                  - name: varlogcontainers
+                    hostPath: { path: /var/log/containers, type: DirectoryOrCreate }
+                  - name: varlogpods
+                    hostPath: { path: /var/log/pods,       type: DirectoryOrCreate }
+                  - name: varlog
+                    hostPath: { path: /var/log,            type: Directory }
+          YAML
+
+          echo "==> Waiting for DaemonSet rollout"
+          kubectl -n "${NS}" rollout status ds/wazuh-agent --timeout=300s || true
+          echo "==> Current DaemonSet & Pods"
+          kubectl -n "${NS}" get ds/wazuh-agent
+          kubectl -n "${NS}" get pods -l app=wazuh-agent -o wide
