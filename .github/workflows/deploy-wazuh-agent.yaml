@@ -81,6 +81,7 @@ jobs:
             echo "Found worker pod: $WPOD"
           fi
 
+      # Patch manager to ensure authd:1515 + remoted:1514, robust quoting via stdin
       - name: Patch manager config (passwordless authd 1515 + remoted 1514)
         shell: bash
         run: |
@@ -154,51 +155,34 @@ jobs:
             sleep 2
           done
 
-      - name: Apply Services, ConfigMap, and DaemonSet
+      - name: Apply Services, ConfigMap, and DaemonSet (send events to MASTER first)
         shell: bash
         run: |
           set -euo pipefail
-          cat <<EOF | kubectl -n "$NS" apply -f -
+          cat <<'EOF' | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
           kind: Service
           metadata:
             name: wazuh
-            labels:
-              app: wazuh-manager
-              node-type: master
+            labels: { app: wazuh-manager, node-type: master }
           spec:
             type: ClusterIP
-            selector:
-              app: wazuh-manager
-              node-type: master
+            selector: { app: wazuh-manager, node-type: master }
             ports:
-              - name: authd
-                port: 1515
-                protocol: TCP
-                targetPort: 1515
+              - { name: authd, port: 1515, protocol: TCP, targetPort: 1515 }
           ---
           apiVersion: v1
           kind: Service
           metadata:
             name: wazuh-workers
-            labels:
-              app: wazuh-manager
-              node-type: worker
+            labels: { app: wazuh-manager, node-type: worker }
           spec:
             type: ClusterIP
-            selector:
-              app: wazuh-manager
-              node-type: worker
+            selector: { app: wazuh-manager, node-type: worker }
             ports:
-              - name: agents-events
-                port: 1514
-                protocol: TCP
-                targetPort: 1514
-              - name: authd
-                port: 1515
-                protocol: TCP
-                targetPort: 1515
+              - { name: agents-events, port: 1514, protocol: TCP, targetPort: 1514 }
+              - { name: authd,         port: 1515, protocol: TCP, targetPort: 1515 }
           ---
           apiVersion: v1
           kind: ConfigMap
@@ -209,7 +193,7 @@ jobs:
               <ossec_config>
                 <client>
                   <server>
-                    <!-- Send events to MASTER first to avoid Invalid ID during enrollment -->
+                    <!-- Send events to MASTER initially; we'll auto-flip to workers after enrollment -->
                     <address>wazuh.wazuh.svc.cluster.local</address>
                     <port>1514</port>
                     <protocol>tcp</protocol>
@@ -236,42 +220,28 @@ jobs:
           kind: DaemonSet
           metadata:
             name: wazuh-agent
-            labels:
-              app: wazuh-agent
+            labels: { app: wazuh-agent }
           spec:
-            selector:
-              matchLabels:
-                app: wazuh-agent
-            updateStrategy:
-              type: RollingUpdate
+            selector: { matchLabels: { app: wazuh-agent } }
+            updateStrategy: { type: RollingUpdate }
             template:
-              metadata:
-                labels:
-                  app: wazuh-agent
+              metadata: { labels: { app: wazuh-agent } }
               spec:
                 hostNetwork: true
                 hostPID: true
                 dnsPolicy: ClusterFirstWithHostNet
                 terminationGracePeriodSeconds: 30
                 tolerations:
-                  - key: node-role.kubernetes.io/master
-                    operator: Exists
-                    effect: NoSchedule
-                  - key: node-role.kubernetes.io/control-plane
-                    operator: Exists
-                    effect: NoSchedule
+                  - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
+                  - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
                 containers:
                   - name: wazuh-agent
                     image: ${IMAGE}
                     imagePullPolicy: IfNotPresent
-                    securityContext:
-                      privileged: true
-                      runAsUser: 0
+                    securityContext: { privileged: true, runAsUser: 0 }
                     env:
                       - name: NODE_NAME
-                        valueFrom:
-                          fieldRef:
-                            fieldPath: spec.nodeName
+                        valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
                       - name: AUTHD_PORT
                         value: "${AUTHD_PORT}"
                       - name: MANAGER_DNS
@@ -338,70 +308,70 @@ jobs:
                         exec:
                           command: ["/bin/sh","-c","/var/ossec/bin/wazuh-control stop || true"]
                     resources:
-                      requests:
-                        cpu: "100m"
-                        memory: "256Mi"
-                      limits:
-                        cpu: "1000m"
-                        memory: "1024Mi"
+                      requests: { cpu: "100m", memory: "256Mi" }
+                      limits:   { cpu: "1000m", memory: "1024Mi" }
                     volumeMounts:
-                      - name: ossec-conf-cm
-                        mountPath: /config
-                        readOnly: true
-                      - name: varlogcontainers
-                        mountPath: /host/var/log/containers
-                        readOnly: true
-                      - name: varlogpods
-                        mountPath: /host/var/log/pods
-                        readOnly: true
-                      - name: varlog
-                        mountPath: /host/var/log
-                        readOnly: true
+                      - { name: ossec-conf-cm,   mountPath: /config,                    readOnly: true }
+                      - { name: varlogcontainers, mountPath: /host/var/log/containers,   readOnly: true }
+                      - { name: varlogpods,       mountPath: /host/var/log/pods,         readOnly: true }
+                      - { name: varlog,           mountPath: /host/var/log,              readOnly: true }
                 volumes:
-                  - name: ossec-conf-cm
-                    configMap:
-                      name: wazuh-agent-ossec
-                  - name: varlogcontainers
-                    hostPath:
-                      path: /var/log/containers
-                      type: DirectoryOrCreate
-                  - name: varlogpods
-                    hostPath:
-                      path: /var/log/pods
-                      type: DirectoryOrCreate
-                  - name: varlog
-                    hostPath:
-                      path: /var/log
-                      type: Directory
+                  - { name: ossec-conf-cm,   configMap: { name: wazuh-agent-ossec } }
+                  - { name: varlogcontainers, hostPath: { path: /var/log/containers, type: DirectoryOrCreate } }
+                  - { name: varlogpods,       hostPath: { path: /var/log/pods,       type: DirectoryOrCreate } }
+                  - { name: varlog,           hostPath: { path: /var/log,            type: Directory } }
           EOF
 
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
 
-      - name: Self-heal re-enroll (only if manager lists none)
+      # Wait until at least one agent shows up in client.keys and the manager sees ≥1 (non-server) agent
+      - name: Verify enrollment on manager
         shell: bash
         run: |
           set -euo pipefail
-          count_agents() {
-            kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc "/var/ossec/bin/agent_control -lc | grep -E '^[[:space:]]*ID:' | grep -v '(server)' | wc -l" 2>/dev/null || echo 0
-          }
-          BEFORE="$(count_agents)"
-          echo "Agents on manager BEFORE: $BEFORE"
-          if [ "$BEFORE" -eq 0 ]; then
-            for P in $(kubectl -n "$NS" get pods -l app=wazuh-agent -o name); do
-              echo "=== Re-enrolling $P ==="
-              kubectl -n "$NS" exec "$P" -- sh -lc '
-                set -e
-                rm -f /var/ossec/etc/agent.id /var/ossec/etc/client.keys
-                AN="$(cat /etc/hostname || echo node)"
-                /var/ossec/bin/agent-auth -m wazuh.wazuh.svc.cluster.local -p 1515 -A "$AN" -G kubernetes || true
-                /var/ossec/bin/wazuh-control restart || true
-              ' || true
-            done
-            sleep 15
+          ok=0
+          for i in {1..24}; do
+            KEYS=$(kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc 'wc -l /var/ossec/etc/client.keys | awk "{print \$1}"' || echo 0)
+            COUNT=$(kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc "/var/ossec/bin/agent_control -lc | grep -E '^[[:space:]]*ID:' | grep -v '(server)' | wc -l" || echo 0)
+            echo "client.keys lines: $KEYS, agent_control count: $COUNT"
+            if [ "${COUNT:-0}" -ge 1 ] || [ "${KEYS:-0}" -ge 5 ]; then ok=1; break; fi
+            sleep 5
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::warning::Enrollment not visible yet; proceeding to auto-flip anyway."
           fi
-          AFTER="$(count_agents)"
-          echo "Agents on manager AFTER:  $AFTER"
+
+      # Auto-flip agent output to workers once enrollment is done (or best-effort)
+      - name: Flip agent events to workers & restart DS
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" get cm wazuh-agent-ossec -o yaml \
+          | sed 's#<address>wazuh\.wazuh\.svc\.cluster\.local</address>#<address>wazuh-workers.wazuh.svc.cluster.local</address>#' \
+          | kubectl apply -f -
+          kubectl -n "$NS" rollout restart ds/wazuh-agent
+          kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
+
+      # Confirm worker remoted sees agents, and manager lists them Active
+      - name: Verify worker remoted connections and Active agents
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${WORKER_POD:-}" ]; then
+            WORKER_POD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            [ -n "$WORKER_POD" ] && echo "WORKER_POD=$WORKER_POD" >> "$GITHUB_ENV"
+          fi
+          if [ -n "${WORKER_POD:-}" ]; then
+            echo "=== Worker remoted recent ==="
+            kubectl -n "$NS" logs "$WORKER_POD" --tail=300 \
+              | egrep -i 'Listening on port 1514|Agent connected|Invalid ID|Authentication file changed' \
+              | tail -n 120 || true
+          else
+            echo "::warning::No worker pod found; skipping worker log check."
+          fi
+
+          echo "=== agent_control -lc ==="
           kubectl -n "$NS" exec "$MASTER_POD" -- /var/ossec/bin/agent_control -lc || true
 
       - name: Final diagnostics
