@@ -23,18 +23,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Install kubectl without sudo into a writable PATH
+      # Install kubectl to a writable PATH (no sudo)
       - name: Ensure kubectl is available (no sudo)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
           if ! command -v kubectl >/dev/null 2>&1; then
-            echo "Installing kubectl to \$HOME/.local/bin"
             curl -fsSL -o "$HOME/.local/bin/kubectl" "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
             chmod +x "$HOME/.local/bin/kubectl"
-          else
-            echo "kubectl already present: $(command -v kubectl)"
           fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           kubectl version --client --output=yaml
@@ -51,14 +48,47 @@ jobs:
           mkdir -p "$HOME/.kube"
           echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
-          echo "Current context: $(kubectl config current-context || true)"
-          echo "Cluster nodes:"; kubectl get nodes -o wide
+          echo "Context: $(kubectl config current-context || true)"
+          kubectl get nodes -o wide || true
+
+      # Make sure the Wazuh manager master pod exists & is Ready
+      - name: Wait for Wazuh manager (master) to be Ready
+        shell: bash
+        run: |
+          set -euo pipefail
+          NS="wazuh"
+          # best-effort: wait until a master-labeled pod is Ready
+          for i in {1..60}; do
+            POD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=master -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+            if [ -n "$POD" ]; then
+              kubectl -n "$NS" wait --for=condition=Ready "pod/$POD" --timeout=60s && break
+            fi
+            sleep 2
+          done
+          [ -n "${POD:-}" ] || { echo "::error::No wazuh-manager master pod found"; kubectl -n "$NS" get pods -l app=wazuh-manager || true; exit 1; }
+          echo "MASTER_POD=$POD" >> "$GITHUB_ENV"
+          echo "NS=$NS" >> "$GITHUB_ENV"
+          echo "Master pod: $POD"
+
+      # Ensure the "kubernetes" group exists on the manager (fixes: Invalid group: kubernetes)
+      - name: Ensure 'kubernetes' group on manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc '
+            set -e
+            d=/var/ossec/etc/shared/kubernetes
+            [ -d "$d" ] || mkdir -p "$d"
+            [ -s "$d/agent.conf" ] || echo "<ossec_config></ossec_config>" > "$d/agent.conf"
+            # show shared groups present
+            ls -1 /var/ossec/etc/shared || true
+          '
 
       - name: Apply Services, ConfigMap, and DaemonSet
         shell: bash
         run: |
           set -euo pipefail
-          NS="wazuh"
+          NS="${NS:-wazuh}"
           IMAGE="ghcr.io/saurab123456/wazuh-agent:4.12.0"
           AUTHD_PORT="1515"
 
@@ -66,49 +96,32 @@ jobs:
           kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
 
           echo "==> Apply resources"
-          # Unquoted heredoc to allow ${IMAGE} expansion here;
-          # all $ inside container script are escaped with \$
+          # Unquoted heredoc to allow ${IMAGE} to expand on the runner;
+          # $ inside the container script is escaped with \$
           cat <<YAML | kubectl -n "${NS}" apply -f -
           ---
           apiVersion: v1
           kind: Service
           metadata:
             name: wazuh
-            labels:
-              app: wazuh-manager
-              node-type: master
+            labels: { app: wazuh-manager, node-type: master }
           spec:
             type: ClusterIP
-            selector:
-              app: wazuh-manager
-              node-type: master
+            selector: { app: wazuh-manager, node-type: master }
             ports:
-              - name: authd
-                port: 1515
-                protocol: TCP
-                targetPort: 1515
+              - { name: authd, port: 1515, protocol: TCP, targetPort: 1515 }
           ---
           apiVersion: v1
           kind: Service
           metadata:
             name: wazuh-workers
-            labels:
-              app: wazuh-manager
-              node-type: worker
+            labels: { app: wazuh-manager, node-type: worker }
           spec:
-            type: LoadBalancer
-            selector:
-              app: wazuh-manager
-              node-type: worker
+            type: ClusterIP
+            selector: { app: wazuh-manager, node-type: worker }
             ports:
-              - name: agents-events
-                port: 1514
-                protocol: TCP
-                targetPort: 1514
-              - name: authd
-                port: 1515
-                protocol: TCP
-                targetPort: 1515
+              - { name: agents-events, port: 1514, protocol: TCP, targetPort: 1514 }
+              - { name: authd,         port: 1515, protocol: TCP, targetPort: 1515 }
           ---
           apiVersion: v1
           kind: ConfigMap
@@ -175,19 +188,17 @@ jobs:
                     env:
                       - name: NODE_NAME
                         valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
-                      - name: POD_NAME
-                        valueFrom: { fieldRef: { fieldPath: metadata.name } }
                       - name: AUTHD_PORT
                         value: "${AUTHD_PORT}"
                       - name: MANAGER_DNS
                         value: "wazuh.wazuh.svc.cluster.local"   # enroll to MASTER (1515)
                       - name: GROUPS
-                        value: "kubernetes"
+                        value: "kubernetes"                       # now guaranteed to exist
                     command: ["/bin/sh","-c"]
                     args:
                       - |
                         set -e
-                        # Stable identity = node name
+                        # Stable identity = node name (prevents duplicate-name churn)
                         AGENT_NAME="\$NODE_NAME"
                         echo "Agent name: \$AGENT_NAME"
 
@@ -195,9 +206,14 @@ jobs:
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
 
+                        # Enroll only if not already enrolled
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          echo "No client keys found, enrolling to \$MANAGER_DNS:\$AUTHD_PORT…"
-                          /var/ossec/bin/agent-auth -m "\$MANAGER_DNS" -p "\$AUTHD_PORT" -A "\$AGENT_NAME" -G "\$GROUPS" || echo "Enrollment finished (duplicates ok)"
+                          echo "Enrolling to \$MANAGER_DNS:\$AUTHD_PORT (group=\$GROUPS)…"
+                          if [ -n "\$GROUPS" ]; then
+                            /var/ossec/bin/agent-auth -m "\$MANAGER_DNS" -p "\$AUTHD_PORT" -A "\$AGENT_NAME" -G "\$GROUPS" || true
+                          else
+                            /var/ossec/bin/agent-auth -m "\$MANAGER_DNS" -p "\$AUTHD_PORT" -A "\$AGENT_NAME" || true
+                          fi
                         fi
 
                         echo "Starting Wazuh agent…"
@@ -253,13 +269,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          NS="wazuh"
+          NS="${NS:-wazuh}"
           echo "Pods:"
-          kubectl -n "${NS}" get pods -o wide
+          kubectl -n "$NS" get pods -o wide
           echo
           echo "Services:"
-          kubectl -n "${NS}" get svc wazuh wazuh-workers -o wide || true
+          kubectl -n "$NS" get svc wazuh wazuh-workers -o wide || true
           echo
           echo "Agents on manager:"
-          MPOD=$(kubectl -n "${NS}" get pod -l app=wazuh-manager,node-type=master -o jsonpath='{.items[0].metadata.name}')
-          kubectl -n "${NS}" exec "$MPOD" -- /var/ossec/bin/agent_control -lc || true
+          kubectl -n "$NS" exec "$MASTER_POD" -- /var/ossec/bin/agent_control -lc || true
