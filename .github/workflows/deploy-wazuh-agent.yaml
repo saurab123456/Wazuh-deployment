@@ -81,16 +81,17 @@ jobs:
             echo "Found worker pod: $WPOD"
           fi
 
+      # ✅ FIX: stream script via stdin instead of nested quotes (this avoids YAML quoting issues)
       - name: Patch manager config (passwordless authd 1515 + remoted 1514)
         shell: bash
         run: |
           set -euo pipefail
-          kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc 'cat >/tmp/fix_manager.sh <<'\''EOS'\''
+          kubectl -n "$NS" exec -i "$MASTER_POD" -- bash -lc 'cat >/tmp/fix_manager.sh && bash /tmp/fix_manager.sh' <<'EOS'
           set -e
           CONF=/var/ossec/etc/ossec.conf
           cp -f "$CONF" "${CONF}.bak.$(date +%s)"
 
-          # Ensure <auth> exists, set port=1515 and use_password=no, force times to 0s
+          # Ensure <auth> exists (1515, no password, force 0s timers)
           if ! grep -q "<auth>" "$CONF"; then
             awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_source_ip>no</use_source_ip>\\n    <force>\\n      <enabled>yes</enabled>\\n      <key_mismatch>yes</key_mismatch>\\n      <disconnected_time enabled=\\\"yes\\\">0s</disconnected_time>\\n      <after_registration_time>0s</after_registration_time>\\n    </force>\\n    <purge>no</purge>\\n    <use_password>no</use_password>\\n    <ssl_verify_host>no</ssl_verify_host>\\n    <ssl_auto_negotiate>yes</ssl_auto_negotiate>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
           fi
@@ -100,7 +101,6 @@ jobs:
           else
             awk "/<auth>/{print;ins=1;next} ins && /<\\/auth>/{print \"    <use_password>no</use_password>\"; print; ins=0; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
           fi
-          # force block values (0s)
           if grep -q "<force>" "$CONF"; then
             sed -i "/<force>/,/<\\/force>/ s#<enabled>.*</enabled>#<enabled>yes</enabled>#" "$CONF"
             sed -i "/<force>/,/<\\/force>/ s#<key_mismatch>.*</key_mismatch>#<key_mismatch>yes</key_mismatch>#" "$CONF"
@@ -116,7 +116,7 @@ jobs:
             fi
           fi
 
-          # Ensure <remote> exists and is secure/tcp/1514
+          # Ensure <remote> exists (secure/tcp/1514)
           if ! grep -q "<remote>" "$CONF"; then
             awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n    <queue_size>131072</queue_size>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
           else
@@ -127,14 +127,15 @@ jobs:
 
           /var/ossec/bin/wazuh-control restart || true
           EOS
-          sh /tmp/fix_manager.sh
+
+          # Show that manager is listening on 1515 and 1514
           kubectl -n "$NS" logs "$MASTER_POD" --tail=200 | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" || true
 
       - name: Ensure shared group 'kubernetes' and permissions
         shell: bash
         run: |
           set -euo pipefail
-          kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc 'cat >/tmp/fix_group.sh <<'\''EOS'\''
+          kubectl -n "$NS" exec -i "$MASTER_POD" -- bash -lc 'cat >/tmp/fix_group.sh && bash /tmp/fix_group.sh' <<'EOS'
           set -e
           d=/var/ossec/etc/shared/kubernetes
           [ -d "$d" ] || mkdir -p "$d"
@@ -143,7 +144,6 @@ jobs:
           find /var/ossec/etc/shared -type d -exec chmod 750 {} \;
           find /var/ossec/etc/shared -type f -exec chmod 640 {} \;
           EOS
-          sh /tmp/fix_group.sh
 
       - name: Wait for manager to expose ports (1515 authd, 1514 remoted)
         shell: bash
