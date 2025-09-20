@@ -55,7 +55,7 @@ jobs:
           echo "Cluster nodes:"
           kubectl get nodes -o wide
 
-      # Call your bash to create CM + DaemonSet (public image; no imagePullSecrets)
+      # Create/Update CM + DaemonSet (public image; no imagePullSecrets)
       - name: Deploy Wazuh Agent
         shell: bash
         run: |
@@ -103,6 +103,8 @@ jobs:
           YAML
 
           echo "==> Apply DaemonSet"
+          # NOTE: heredoc is unquoted so ${IMAGE} expands on the runner.
+          # All pod-side variables are escaped like \$NODE_NAME so they expand INSIDE the container, not here.
           cat <<YAML | kubectl -n "${NS}" apply -f -
           apiVersion: apps/v1
           kind: DaemonSet
@@ -143,15 +145,18 @@ jobs:
                     args:
                       - |
                         set -e
-                        AGENT_NAME="${NODE_NAME}-${POD_NAME}"
-                        echo "Agent name: ${AGENT_NAME}"
+                        AGENT_NAME="\$NODE_NAME-\$POD_NAME"
+                        echo "Agent name: \$AGENT_NAME"
+
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          echo "No client keys found, enrolling to ${MANAGER_DNS}:${AUTHD_PORT}…"
-                          /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" || echo "Enrollment finished (duplicates ok)"
+                          echo "No client keys found, enrolling to \$MANAGER_DNS:\$AUTHD_PORT…"
+                          /var/ossec/bin/agent-auth -m "\$MANAGER_DNS" -p "\$AUTHD_PORT" -A "\$AGENT_NAME" -G "\$GROUPS" || echo "Enrollment finished (duplicates ok)"
                         fi
+
                         echo "Starting Wazuh agent…"
                         /var/ossec/bin/wazuh-control start
                         sleep 5
