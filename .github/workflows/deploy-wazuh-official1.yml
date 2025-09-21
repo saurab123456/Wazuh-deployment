@@ -160,15 +160,15 @@ jobs:
               # Ensure auth section exists with passwordless config
               if grep -q "<auth>" "$CONFIG_FILE"; then
                 # Update existing auth section
-                sed -i '/<auth>/,/<\/auth>/ {
+                sed -i '\''/<auth>/,/<\/auth>/ {
                   s/<disabled>.*<\/disabled>/<disabled>no<\/disabled>/
                   s/<port>.*<\/port>/<port>1515<\/port>/
                   s/<use_password>.*<\/use_password>/<use_password>no<\/use_password>/
                   /<password>.*<\/password>/d
-                }' "$CONFIG_FILE"
+                }'\'' "$CONFIG_FILE"
               else
                 # Add auth section
-                cat >> "$CONFIG_FILE" <<'AUTH_CONFIG'
+                cat >> "$CONFIG_FILE" <<'\''AUTH_CONFIG'\''
               
               <auth>
                 <disabled>no</disabled>
@@ -181,7 +181,7 @@ AUTH_CONFIG
               
               # Verify the configuration
               echo "=== Current auth configuration ==="
-              sed -n '/<auth>/,/<\/auth>/p' "$CONFIG_FILE"
+              sed -n '\''/<auth>/,/<\/auth>/p'\'' "$CONFIG_FILE"
               
               # Restart wazuh-manager to apply changes
               echo "Restarting wazuh-manager..."
@@ -261,7 +261,7 @@ AUTH_CONFIG
                     echo "❌ FAILED: Cannot connect to wazuh service on port 1515"
                     exit 1
                   fi
-          EOF
+            EOF
             
             # Wait for test to complete
             kubectl -n "$NS" wait --for=condition=Ready pod/connectivity-test --timeout=30s || true
