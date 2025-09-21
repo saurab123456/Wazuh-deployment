@@ -262,6 +262,7 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
+      # === Passworded enrollment alignment (Manager + Agents) ===
       - name: Enable authd with password on ALL managers
         env:
           MANAGER_SELECTOR: app=wazuh-manager
@@ -286,13 +287,31 @@ jobs:
               else
                 awk -v P="${PASS}" "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>yes</use_password>\\n    <password>\" P \"</password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
-              if grep -q "<remote>" "$CONF"; then
-                sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
-              else
-                awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
-              fi
             '
           done
+
+      - name: Create/Update manager authd.pass Secret and mount into managers
+        shell: bash
+        run: |
+          set -euo pipefail
+          PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+
+          # Single source of truth: this Secret's value must match the agents' Secret below.
+          kubectl -n "$NS" create secret generic wazuh-authd-pass \
+            --from-literal=authd.pass="$PASS" \
+            -o yaml --dry-run=client | kubectl apply -f -
+
+          # Patch master/worker StatefulSets to mount the file at /var/ossec/etc/authd.pass
+          patch_sts () {
+            local sts="$1"
+            kubectl -n "$NS" get sts "$sts" >/dev/null 2>&1 || return 0
+            kubectl -n "$NS" patch sts "$sts" --type='json' -p='[
+              {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"authd-pass","secret":{"secretName":"wazuh-authd-pass"}}},
+              {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"authd-pass","mountPath":"/var/ossec/etc/authd.pass","subPath":"authd.pass","readOnly":true}}
+            ]' || true
+          }
+          patch_sts wazuh-manager-master
+          patch_sts wazuh-manager-worker
 
       - name: Restart manager StatefulSets (safe)
         shell: bash
@@ -310,9 +329,12 @@ jobs:
         run: |
           set -euo pipefail
           PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+
+          # Agents use this Secret via env: ENROLL_PASS (and it MUST match wazuh-authd-pass above)
           kubectl -n "$NS" create secret generic wazuh-enroll-pass \
             --from-literal=enroll_pass="$PASS" \
             --dry-run=client -o yaml | kubectl apply -f -
+
           cat > /tmp/agent-ossec.conf <<EOF
           <ossec_config>
             <client>
@@ -374,7 +396,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # **Important**: delete first to avoid strategic-merge mixing `value` and `valueFrom`
           kubectl -n "$NS" delete ds wazuh-agent --ignore-not-found=true
           cat <<'EOF' | kubectl -n "$NS" apply -f -
           apiVersion: apps/v1
