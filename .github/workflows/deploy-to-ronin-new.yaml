@@ -1,1 +1,58 @@
 
+name: Verify Ronin Connection (Self-Hosted)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    # These labels must match your runner's labels on the Ronin VM
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
+    timeout-minutes: 10
+
+    env:
+      KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
+
+    steps:
+      - name: Verify runner connection
+        run: |
+          echo "✅ Connected to runner: $(hostname)"
+          echo "Time: $(date)"
+          uname -a
+
+      - name: Install kubectl if missing
+        run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KVER="$(curl -sS https://dl.k8s.io/release/stable.txt)"
+            curl -sSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
+            chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          fi
+          kubectl version --client --short
+
+      - name: Check kubeconfig secret exists
+        run: |
+          if [ -z "${{ secrets.KUBE_CONFIG_B64_RONIN_NEW }}" ]; then
+            echo "❌ Secret KUBE_CONFIG_B64_RONIN_NEW is missing or empty!"
+            exit 1
+          else
+            echo "✅ Secret KUBE_CONFIG_B64_RONIN_NEW found (length: $(echo -n "${{ secrets.KUBE_CONFIG_B64_RONIN_NEW }}" | wc -c) chars)"
+          fi
+
+      - name: Decode kubeconfig (safe preview)
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_B64_RONIN_NEW }}" | base64 -d > "$KUBECONFIG"
+          echo "First 5 lines of decoded kubeconfig:"
+          head -n 5 "$KUBECONFIG"
+
+      - name: Show context/server from kubeconfig
+        run: |
+          kubectl config get-contexts
+          kubectl config current-context || true
+          kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'; echo
+
+      - name: Live cluster check (nodes + API)
+        run: |
+          set -euo pipefail
+          kubectl cluster-info
+          kubectl get nodes -o wide
+          echo "✅ Cluster reachable and responding"
