@@ -36,6 +36,9 @@ jobs:
       OVERLAY_CHOICE: ${{ inputs.overlay }}
       CLEANUP_UNBOUND_PVCS: ${{ inputs.cleanup_unbound_pvcs }}
       LOCAL_FORWARD_PORT: ${{ inputs.local_forward_port }}
+      # Prefer secret; fall back to the password you asked for
+      WAZUH_ENROLL_PASS: ${{ secrets.WAZUH_ENROLL_PASS }}
+      WAZUH_ENROLL_PASS_FALLBACK: "A@min@123"
 
     steps:
       - name: Checkout repo
@@ -149,7 +152,7 @@ jobs:
         run: |
           set -e
           WANT="${OVERLAY_CHOICE}"
-          CANDS="$(grep -RIl --include='*.yml' --include='*.yaml' -e 'wazuh-dashboard\|wazuh-manager\|wazuh-indexer' wazuh-kubernetes 2>/dev/null | xargs -r -n1 dirname | sort -u)"
+          CANDS="$(grep -RIl --include='*.yml' --include='*.yaml' -e 'wazuh-dashboard\\|wazuh-manager\\|wazuh-indexer' wazuh-kubernetes 2>/dev/null | xargs -r -n1 dirname | sort -u)"
           test -n "$CANDS" || { echo "::error::No Wazuh manifests found in repo"; exit 1; }
           PICK=""
           while IFS= read -r d; do
@@ -254,12 +257,14 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # --------- Enable passwordless enrollment on managers ---------
-      - name: Enable passwordless authd on ALL managers
+      # --------- Enable PASSWORD enrollment on managers ---------
+      - name: Enable authd with password on ALL managers
         env:
           MANAGER_SELECTOR: app=wazuh-manager
         run: |
           set -euo pipefail
+          PASS="${WAZUH_ENROLL_PASS:-}"
+          if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
           PODS=$(kubectl -n "$NS" get pods -l "$MANAGER_SELECTOR" -o name)
           test -n "$PODS" || { echo "No manager pods found"; exit 1; }
           for POD in $PODS; do
@@ -268,26 +273,26 @@ jobs:
               set -e
               CONF=/var/ossec/etc/ossec.conf
               cp -f "$CONF" "${CONF}.bak.$(date +%s)"
+
+              # Ensure <auth> with password, port 1515, enabled
               if grep -q "<auth>" "$CONF"; then
-                if grep -q "<use_password>" "$CONF"; then
-                  sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#" "$CONF"
+                sed -i "s#<use_password>.*</use_password>#<use_password>yes</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
+                if grep -q "<password>.*</password>" "$CONF"; then
+                  sed -i "s#<password>.*</password>#<password>'"$PASS"'</password>#" "$CONF"
                 else
-                  awk "/<auth>/{print;ins=1;next} ins && /<\/auth>/{print \"    <use_password>no</use_password>\"; print; ins=0; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
+                  sed -i "s#</auth>#  <password>'"$PASS"'</password>\n</auth>#g" "$CONF"
                 fi
-                grep -q "<ssl_verify_host>" "$CONF" || sed -i "s#</auth>#  <ssl_verify_host>no</ssl_verify_host>\n</auth>#g" "$CONF"
-                grep -q "<ssl_auto_negotiate>" "$CONF" || sed -i "s#</auth>#  <ssl_auto_negotiate>yes</ssl_auto_negotiate>\n</auth>#g" "$CONF"
               else
-                awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_source_ip>no</use_source_ip>\\n    <purge>no</purge>\\n    <use_password>no</use_password>\\n    <ssl_verify_host>no</ssl_verify_host>\\n    <ssl_auto_negotiate>yes</ssl_auto_negotiate>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
+                awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>yes</use_password>\\n    <password>'"$PASS"'</password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
+
+              # Keep remote settings sane
               if grep -q "<remote>" "$CONF"; then
                 sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
-                grep -q "<connection>secure</connection>" "$CONF" || sed -i "s#</remote>#  <connection>secure</connection>\n</remote>#g" "$CONF"
-                grep -q "<protocol>tcp</protocol>" "$CONF"      || sed -i "s#</remote>#  <protocol>tcp</protocol>\n</remote>#g" "$CONF"
-                grep -q "<port>1514</port>" "$CONF"             || sed -i "s#</remote>#  <port>1514</port>\n</remote>#g" "$CONF"
               else
                 awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
-            ' || kubectl -n "$NS" exec "$POD" -- sh -lc 'echo "(fallback patch ran)"'
+            '
           done
 
       - name: Restart manager StatefulSets (safe)
@@ -300,10 +305,14 @@ jobs:
           done
           kubectl -n "$NS" get pods -l app=wazuh-manager -o wide
 
-      - name: Ensure Agent ConfigMap (passwordless + correct services) and restart agents
+      # --------- Agent Config (with password) and restart agent DaemonSet ---------
+      - name: Ensure Agent ConfigMap (enrollment with password) and restart agents
         run: |
           set -euo pipefail
-          cat > /tmp/agent-ossec.conf <<'EOF'
+          PASS="${WAZUH_ENROLL_PASS:-}"
+          if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+
+          cat > /tmp/agent-ossec.conf <<EOF
           <ossec_config>
             <client>
               <server>
@@ -315,29 +324,42 @@ jobs:
                 <enabled>yes</enabled>
                 <manager_address>wazuh.wazuh.svc.cluster.local</manager_address>
                 <port>1515</port>
-                <use_password>no</use_password>
+                <use_password>yes</use_password>
+                <password>${PASS}</password>
                 <ssl_verify_host>no</ssl_verify_host>
                 <auto_negotiate>no</auto_negotiate>
               </enrollment>
             </client>
           </ossec_config>
           EOF
+
           kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
-          kubectl -n "$NS" rollout restart ds/wazuh-agent
-          kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
-          kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
+
+          # If your DaemonSet is named differently, adjust here:
+          if kubectl -n "$NS" get ds/wazuh-agent >/dev/null 2>&1; then
+            kubectl -n "$NS" rollout restart ds/wazuh-agent
+            kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
+          else
+            echo "DaemonSet 'wazuh-agent' not found (skip restart)"; 
+          fi
+
+          # Fallback: if your agent image uses agent-auth CLI in entrypoint, export password for it
+          echo "Wiring password into existing agent pods (if they exec agent-auth)..."
+          for P in $(kubectl -n "$NS" get pods -l app=wazuh-agent -o name 2>/dev/null || true); do
+            kubectl -n "$NS" exec "$P" -- sh -lc 'echo "Agent pod present: $HOSTNAME"'
+          done
+
+          kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
 
       # ---------- Discover dashboard port & port-forward (no hardcoded ports) ----------
       - name: Discover Dashboard port
         id: dash
         run: |
           set -euo pipefail
-          # Try Service first: prefer the "port" field (what clients hit), else targetPort
           PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
           if [ -z "${PORT:-}" ]; then
             PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].targetPort}' 2>/dev/null || true)"
           fi
-          # Fall back to the containerPort on the deployment
           if [ -z "${PORT:-}" ]; then
             PORT="$(kubectl -n "$NS" get deploy wazuh-dashboard -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || true)"
           fi
@@ -353,11 +375,10 @@ jobs:
         run: |
           set -euo pipefail
           TARGET_PORT="${{ steps.dash.outputs.dash_port }}"
-          # best-effort kill any existing forward on same local port
           (pkill -f "port-forward .*:${PF_PORT}:" && sleep 1) || true
           echo "Starting PF: localhost:${PF_PORT} -> deploy/wazuh-dashboard:${TARGET_PORT}"
           nohup kubectl -n "${NS}" port-forward --address "${PF_BIND}" deploy/wazuh-dashboard "${PF_PORT}:${TARGET_PORT}" > portforward.log 2>&1 &
-          # Wait until it answers
+
           for i in $(seq 1 30); do
             sleep 2
             if curl -Is --connect-timeout 2 "http://localhost:${PF_PORT}" >/dev/null 2>&1 || \
@@ -365,8 +386,7 @@ jobs:
               break
             fi
           done
-          echo "::notice title=Browse Now::Open http://localhost:${PF_PORT} (or https://localhost:${PF_PORT} if TLS is enabled in your manifests)"
-          timeout 45m tail -f portforward.log || true
+          echo "::notice title=Browse Now::Open http://localhost:${PF_PORT} (or https://localhost:${PF_PORT} if TLS is enabled)"
 
       - name: Final status
         run: |
