@@ -18,7 +18,6 @@ on:
 
 jobs:
   deploy:
-    # Run on your Ronin self-hosted runner
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
     timeout-minutes: 45
 
@@ -34,10 +33,8 @@ jobs:
 
       - name: Verify runner + kubectl
         run: |
-          echo "Host: $(hostname)"
-          date
+          echo "Host: $(hostname)"; date
           if ! command -v kubectl >/dev/null 2>&1; then
-            echo "Installing kubectl..."
             KVER="$(curl -sS https://dl.k8s.io/release/stable.txt)"
             curl -sSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
             chmod +x kubectl && sudo mv kubectl /usr/local/bin/
@@ -50,7 +47,6 @@ jobs:
         run: |
           test -n "$KUBE_CONFIG_B64" || { echo "::error::Secret KUBE_CONFIG_B64 missing"; exit 1; }
           echo "$KUBE_CONFIG_B64" | base64 -d > "$KUBECONFIG"
-          echo "Context:"; kubectl config current-context || true
           kubectl cluster-info
           kubectl get nodes -o wide
 
@@ -58,7 +54,7 @@ jobs:
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # --- Sysctl: vm.max_map_count=262144 on every node (immediate + persistent) ---
+      # ---------------- SYSCTL: vm.max_map_count ----------------
       - name: Apply sysctl DaemonSet (vm.max_map_count=262144 on all nodes)
         run: |
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
@@ -90,18 +86,20 @@ jobs:
                     args:
                       - |
                         set -e
+                        # Apply live value on host
                         echo 262144 > /host-proc/sys/vm/max_map_count
+                        # Persist across reboots
                         mkdir -p /host-etc/sysctl.d
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
-                        echo "vm.max_map_count=$(cat /host-proc/sys/vm/max_map_count)"
-                        sleep 3
-                        exit 0
+                        echo "vm.max_map_count now: $(cat /host-proc/sys/vm/max_map_count)"
+                        # Keep container alive briefly so logs can be read before we delete the DS
+                        sleep 180
                     volumeMounts:
                       - name: host-proc
                         mountPath: /host-proc
                       - name: host-etc
                         mountPath: /host-etc
-                restartPolicy: OnFailure
+                restartPolicy: Always
                 volumes:
                   - name: host-proc
                     hostPath:
@@ -125,11 +123,11 @@ jobs:
             kubectl -n kube-system logs "$p" || true
           done
 
-      - name: Cleanup sysctl DS (persistent config remains on nodes)
+      - name: Cleanup sysctl DS (keeps /etc/sysctl.d/99-wazuh.conf on nodes)
         run: |
           kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
+      # ---------------- END SYSCTL ----------------
 
-      # --- StorageClass alias 'wazuh-storage' pointing to a dynamic provisioner ---
       - name: Ensure dynamic StorageClass alias 'wazuh-storage'
         run: |
           set -euo pipefail
@@ -143,7 +141,6 @@ jobs:
           TARGET_PROV=$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')
           echo "Using SC '${TARGET_SC}' (${TARGET_PROV}) for wazuh-storage"
 
-          # Recreate alias if needed
           if kubectl get sc wazuh-storage >/dev/null 2>&1; then
             CUR_PROV=$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}')
             if [ "$CUR_PROV" != "$TARGET_PROV" ]; then
@@ -164,7 +161,6 @@ jobs:
 
           kubectl get sc -o wide
 
-      # --- Fetch and apply official Wazuh manifests ---
       - name: Fetch official wazuh-kubernetes repo
         run: |
           set -euo pipefail
@@ -173,16 +169,14 @@ jobs:
           echo "Fetched wazuh-kubernetes@$WAZUH_K8S_TAG"
           ls -la wazuh-kubernetes
 
-      - name: Pick overlay path (single-node or production-cluster)
+      - name: Determine overlay path
         id: pick
         run: |
-          set -euo pipefail
           case "$OVERLAY" in
-            single-node)        echo "overlay_path=single-node" >> "$GITHUB_OUTPUT" ;;
+            single-node)        echo "overlay_path=single-node"        >> "$GITHUB_OUTPUT" ;;
             production-cluster) echo "overlay_path=production_cluster" >> "$GITHUB_OUTPUT" ;;
             *) echo "::error::Unknown overlay: $OVERLAY"; exit 1 ;;
           esac
-          echo "Chosen overlay: $OVERLAY -> $(cat $GITHUB_OUTPUT | cut -d= -f2)"
 
       - name: Inject namespace if missing (idempotent)
         run: |
@@ -198,20 +192,17 @@ jobs:
               ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
             fi
           done
-          echo "Namespace ensured for overlay files."
 
       - name: Apply official manifests
         run: |
-          set -euo pipefail
           kubectl apply -f wazuh-kubernetes/${{ steps.pick.outputs.overlay_path }}/
-          echo "Applied overlay: $OVERLAY"
 
       - name: Wait for core components
         run: |
           set -euxo pipefail
           kubectl -n "$NS" get pods -o wide || true
-          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-manager --timeout=1200s || true
-          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-indexer --timeout=1200s || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-manager  --timeout=1200s || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-indexer  --timeout=1200s || true
           kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-dashboard --timeout=1200s || true
           kubectl -n "$NS" get pods -o wide
 
@@ -223,7 +214,6 @@ jobs:
             echo "::warning::Dashboard Service not found; skipping."
             exit 0
           fi
-          # Force NodePort and let K8s allocate a port
           kubectl -n "$NS" patch svc "$SVC" -p '{"spec":{"type":"NodePort"}}'
           kubectl -n "$NS" patch svc "$SVC" --type='json' -p='[{"op":"remove","path":"/spec/ports/0/nodePort"}]' || true
           PORT=$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.spec.ports[0].nodePort}')
