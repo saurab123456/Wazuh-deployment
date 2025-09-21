@@ -81,85 +81,25 @@ jobs:
             echo "Found worker pod: $WPOD"
           fi
 
-      # Patch manager to ensure authd:1515 + remoted:1514, robust quoting via stdin
-      - name: Patch manager config (passwordless authd 1515 + remoted 1514)
+      # (Optional) If your GHCR image is private, create once and then uncomment imagePullSecrets below:
+      # kubectl -n wazuh create secret docker-registry ghcr-secret \
+      #   --docker-server=ghcr.io \
+      #   --docker-username=YOUR_GITHUB_USERNAME \
+      #   --docker-password=YOUR_GHCR_PAT
+
+      - name: Confirm manager ports (no config patching)
         shell: bash
         run: |
           set -euo pipefail
-          kubectl -n "$NS" exec -i "$MASTER_POD" -- bash -lc 'cat >/tmp/fix_manager.sh && bash /tmp/fix_manager.sh' <<'EOS'
-          set -e
-          CONF=/var/ossec/etc/ossec.conf
-          cp -f "$CONF" "${CONF}.bak.$(date +%s)"
-
-          # Ensure <auth> exists (1515, no password, zero force timers)
-          if ! grep -q "<auth>" "$CONF"; then
-            awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_source_ip>no</use_source_ip>\\n    <force>\\n      <enabled>yes</enabled>\\n      <key_mismatch>yes</key_mismatch>\\n      <disconnected_time enabled=\\\"yes\\\">0s</disconnected_time>\\n      <after_registration_time>0s</after_registration_time>\\n    </force>\\n    <purge>no</purge>\\n    <use_password>no</use_password>\\n    <ssl_verify_host>no</ssl_verify_host>\\n    <ssl_auto_negotiate>yes</ssl_auto_negotiate>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
-          fi
-          sed -i "/<auth>/,/<\\/auth>/ s#<port>.*</port>#<port>1515</port>#" "$CONF"
-          if grep -q "<use_password>" "$CONF"; then
-            sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#g" "$CONF"
-          else
-            awk "/<auth>/{print;ins=1;next} ins && /<\\/auth>/{print \"    <use_password>no</use_password>\"; print; ins=0; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
-          fi
-          if grep -q "<force>" "$CONF"; then
-            sed -i "/<force>/,/<\\/force>/ s#<enabled>.*</enabled>#<enabled>yes</enabled>#" "$CONF"
-            sed -i "/<force>/,/<\\/force>/ s#<key_mismatch>.*</key_mismatch>#<key_mismatch>yes</key_mismatch>#" "$CONF"
-            if grep -q "<disconnected_time" "$CONF"; then
-              sed -i "0,/<disconnected_time/{s#<disconnected_time[^>]*>.*</disconnected_time>#<disconnected_time enabled=\\\"yes\\\">0s</disconnected_time>#}" "$CONF"
-            else
-              awk "/<force>/{print;ins=1;next} ins && /<\\/force>/{print \"      <disconnected_time enabled=\\\"yes\\\">0s</disconnected_time>\"; print; ins=0; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
-            fi
-            if grep -q "<after_registration_time>" "$CONF"; then
-              sed -i "0,/<after_registration_time>/{s#<after_registration_time>.*</after_registration_time>#<after_registration_time>0s</after_registration_time>#}" "$CONF"
-            else
-              awk "/<force>/{print;ins=1;next} ins && /<\\/force>/{print \"      <after_registration_time>0s</after_registration_time>\"; print; ins=0; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
-            fi
-          fi
-
-          # Ensure <remote> exists (secure/tcp/1514)
-          if ! grep -q "<remote>" "$CONF"; then
-            awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n    <queue_size>131072</queue_size>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
-          else
-            sed -i "/<remote>/,/<\\/remote>/ s#<connection>.*</connection>#<connection>secure</connection>#" "$CONF"
-            sed -i "/<remote>/,/<\\/remote>/ s#<port>.*</port>#<port>1514</port>#" "$CONF"
-            sed -i "/<remote>/,/<\\/remote>/ s#<protocol>.*</protocol>#<protocol>tcp</protocol>#" "$CONF"
-          fi
-
-          /var/ossec/bin/wazuh-control restart || true
-          EOS
-
-          kubectl -n "$NS" logs "$MASTER_POD" --tail=200 | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" || true
-
-      - name: Ensure shared group 'kubernetes' and permissions
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl -n "$NS" exec -i "$MASTER_POD" -- bash -lc 'cat >/tmp/fix_group.sh && bash /tmp/fix_group.sh' <<'EOS'
-          set -e
-          d=/var/ossec/etc/shared/kubernetes
-          [ -d "$d" ] || mkdir -p "$d"
-          [ -s "$d/agent.conf" ] || echo "<ossec_config></ossec_config>" > "$d/agent.conf"
-          chown -R wazuh:wazuh /var/ossec/etc/shared
-          find /var/ossec/etc/shared -type d -exec chmod 750 {} \;
-          find /var/ossec/etc/shared -type f -exec chmod 640 {} \;
-          EOS
-
-      - name: Wait for manager to expose ports (1515 authd, 1514 remoted)
-        shell: bash
-        run: |
-          set -euo pipefail
-          for i in {1..60}; do
-            L="$(kubectl -n "$NS" logs "$MASTER_POD" --tail=300 || true)"
-            echo "$L" | grep -q "Accepting connections on port 1515" && \
-            echo "$L" | grep -q "Listening on port 1514/TCP" && { echo "Manager ports OK"; break; }
-            sleep 2
-          done
+          # Print last log lines; Wazuh defaults are authd:1515 and remoted:1514
+          kubectl -n "$NS" logs "$MASTER_POD" --tail=400 || true
 
       - name: Apply Services, ConfigMap, and DaemonSet (send events to MASTER first)
         shell: bash
         run: |
           set -euo pipefail
-          cat <<'EOF' | kubectl -n "$NS" apply -f -
+          # NOTE: unquoted heredoc so ${IMAGE} etc. expand
+          cat <<EOF | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
           kind: Service
@@ -193,7 +133,6 @@ jobs:
               <ossec_config>
                 <client>
                   <server>
-                    <!-- Send events to MASTER initially; we'll auto-flip to workers after enrollment -->
                     <address>wazuh.wazuh.svc.cluster.local</address>
                     <port>1514</port>
                     <protocol>tcp</protocol>
@@ -234,6 +173,9 @@ jobs:
                 tolerations:
                   - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
                   - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+                # Uncomment if you created ghcr-secret for private images:
+                # imagePullSecrets:
+                #   - name: ghcr-secret
                 containers:
                   - name: wazuh-agent
                     image: ${IMAGE}
@@ -252,29 +194,29 @@ jobs:
                     args:
                       - |
                         set -e
-                        AGENT_NAME="\$NODE_NAME"
-                        echo "Agent name: \$AGENT_NAME"
+                        AGENT_NAME="$NODE_NAME"
+                        echo "Agent name: $AGENT_NAME"
 
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
 
                         enroll() {
-                          echo "Enrolling to \$MANAGER_DNS:\$AUTHD_PORT (group=\$GROUPS)…"
-                          if [ -n "\$GROUPS" ]; then
-                            /var/ossec/bin/agent-auth -m "\$MANAGER_DNS" -p "\$AUTHD_PORT" -A "\$AGENT_NAME" -G "\$GROUPS"
+                          echo "Enrolling to $MANAGER_DNS:$AUTHD_PORT (group=$GROUPS)…"
+                          if [ -n "$GROUPS" ]; then
+                            /var/ossec/bin/agent-auth -m "$MANAGER_DNS" -p "$AUTHD_PORT" -A "$AGENT_NAME" -G "$GROUPS"
                           else
-                            /var/ossec/bin/agent-auth -m "\$MANAGER_DNS" -p "\$AUTHD_PORT" -A "\$AGENT_NAME"
+                            /var/ossec/bin/agent-auth -m "$MANAGER_DNS" -p "$AUTHD_PORT" -A "$AGENT_NAME"
                           fi
                         }
 
                         # Retry enrollment up to 12 times (~2 minutes)
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          for i in \$(seq 1 12); do
+                          for i in $(seq 1 12); do
                             if enroll; then
                               break
                             fi
-                            echo "Enroll attempt \$i failed; retrying in 10s…"
+                            echo "Enroll attempt $i failed; retrying in 10s…"
                             sleep 10
                           done
                         fi
@@ -325,7 +267,6 @@ jobs:
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
 
-      # Wait until at least one agent shows up in client.keys and the manager sees ≥1 (non-server) agent
       - name: Verify enrollment on manager
         shell: bash
         run: |
@@ -342,7 +283,6 @@ jobs:
             echo "::warning::Enrollment not visible yet; proceeding to auto-flip anyway."
           fi
 
-      # Auto-flip agent output to workers once enrollment is done (or best-effort)
       - name: Flip agent events to workers & restart DS
         shell: bash
         run: |
@@ -353,7 +293,6 @@ jobs:
           kubectl -n "$NS" rollout restart ds/wazuh-agent
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
 
-      # Confirm worker remoted sees agents, and manager lists them Active
       - name: Verify worker remoted connections and Active agents
         shell: bash
         run: |
