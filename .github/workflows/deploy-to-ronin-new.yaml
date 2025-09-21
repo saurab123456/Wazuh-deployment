@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       overlay:
-        description: "Overlay to deploy"
+        description: "Overlay to deploy (single or production)"
         required: true
         default: single
         type: choice
@@ -14,12 +14,12 @@ on:
         required: true
         default: v4.12.0
       cleanup_unbound_pvcs:
-        description: "Delete only UNBOUND PVCs before re-deploy (safe cleanup)"
+        description: "Delete only UNBOUND PVCs before deploy"
         required: true
         default: true
         type: boolean
       local_forward_port:
-        description: "Port to suggest for local port-forward"
+        description: "Local port for port-forward (optional)"
         required: true
         default: "8444"
 
@@ -71,13 +71,16 @@ jobs:
           metadata:
             name: wazuh-sysctl
             namespace: kube-system
-            labels: { app: wazuh-sysctl }
+            labels:
+              app: wazuh-sysctl
           spec:
             selector:
-              matchLabels: { app: wazuh-sysctl }
+              matchLabels:
+                app: wazuh-sysctl
             template:
               metadata:
-                labels: { app: wazuh-sysctl }
+                labels:
+                  app: wazuh-sysctl
               spec:
                 hostPID: true
                 tolerations:
@@ -85,7 +88,8 @@ jobs:
                 containers:
                   - name: sysctl
                     image: busybox:1.36
-                    securityContext: { privileged: true }
+                    securityContext:
+                      privileged: true
                     command: ["/bin/sh","-c"]
                     args:
                       - |
@@ -96,11 +100,19 @@ jobs:
                         echo "vm.max_map_count now: $(cat /host-proc/sys/vm/max_map_count)"
                         sleep 120
                     volumeMounts:
-                      - { name: host-proc, mountPath: /host-proc }
-                      - { name: host-etc,  mountPath: /host-etc  }
+                      - name: host-proc
+                        mountPath: /host-proc
+                      - name: host-etc
+                        mountPath: /host-etc
                 volumes:
-                  - { name: host-proc, hostPath: { path: /proc, type: Directory } }
-                  - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
+                  - name: host-proc
+                    hostPath:
+                      path: /proc
+                      type: Directory
+                  - name: host-etc
+                    hostPath:
+                      path: /etc
+                      type: Directory
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
 
@@ -141,7 +153,8 @@ jobs:
           cat <<EOF | kubectl apply -f -
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
-          metadata: { name: wazuh-storage }
+          metadata:
+            name: wazuh-storage
           provisioner: ${TARGET_PROV}
           reclaimPolicy: Delete
           volumeBindingMode: WaitForFirstConsumer
@@ -245,7 +258,7 @@ jobs:
           kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-dashboard --timeout=1200s || true
           kubectl -n "$NS" get pods -o wide
 
-      # --------- FIXED SERVICE NAME + NODEPORT (no extra commands needed) ----------
+      # --------- FIXED SERVICE NAME + NODEPORT ----------
       - name: Expose Dashboard via fixed NodePort
         run: |
           set -euo pipefail
@@ -272,7 +285,7 @@ jobs:
           echo "🌐 Wazuh Dashboard fixed URL: https://${NODE_IP}:${NODEPORT}"
           echo "✅ Service available at svc/${DASH_SVC} in namespace ${NS}"
 
-      # --------- Also print a one-liner for local port-forward (optional) ----------
+      # --------- Optional localhost port-forward one-liner ----------
       - name: Print port-forward one-liner (optional)
         run: |
           echo "🔌 If you prefer localhost instead of NodePort, run:"
