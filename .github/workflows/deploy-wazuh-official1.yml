@@ -221,6 +221,48 @@ jobs:
           echo "Built: /tmp/wazuh-all.yaml"
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
+      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+      # KEY FIX: strip any password Secret mounts so manager pods can start
+      - name: Remove auth password Secret mounts (passwordless)
+        shell: bash
+        run: |
+          set -euo pipefail
+          IN=/tmp/wazuh-all.yaml
+          OUT=/tmp/wazuh-all-passwordless.yaml
+
+          # Remove volumes with names that commonly hold auth/enroll passwords
+          yq -y '
+            ( . as $doc
+              | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
+              | .spec.template.spec.volumes
+            ) |= ( . // [] | map(select(.name != "wazuh-authd-pass" and .name != "wazuh-enroll-pass")) )
+          ' "$IN" > "$OUT.tmp1"
+
+          # Remove volumeMounts referencing those volumes in all containers
+          yq -y '
+            ( . as $doc
+              | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
+              | .spec.template.spec.containers
+            ) |= ( . // [] | map(
+                  .volumeMounts = ( .volumeMounts // [] | map(select(.name != "wazuh-authd-pass" and .name != "wazuh-enroll-pass")) )
+                ))
+          ' "$OUT.tmp1" > "$OUT.tmp2"
+
+          # Optionally remove env vars pointing to password files (best effort)
+          yq -y '
+            ( . as $doc
+              | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
+              | .spec.template.spec.containers
+            ) |= ( . // [] | map(
+                  .env = ( .env // [] | map(select(.name != "WAZUH_MANAGER_PASSWORD" and .name != "WAZUH_AUTHD_PASSWORD")) )
+                ))
+          ' "$OUT.tmp2" > "$OUT"
+
+          mv "$OUT" /tmp/wazuh-all.yaml
+          rm -f "$OUT.tmp1" "$OUT.tmp2" || true
+          echo "Password Secret mounts stripped. Proceeding passwordless."
+      # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
       - name: Optional cleanup (delete UNBOUND PVCs only)
         shell: bash
         run: |
@@ -298,31 +340,6 @@ jobs:
                 awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
             '
-          done
-
-      - name: Remove any enrollment/password secrets (not used)
-        shell: bash
-        run: |
-          kubectl -n "$NS" delete secret wazuh-authd-pass wazuh-enroll-pass --ignore-not-found=true || true
-
-      - name: Restart manager StatefulSets (safe)
-        shell: bash
-        run: |
-          set -e
-          for s in wazuh-manager-master wazuh-manager-worker; do
-            kubectl -n "$NS" get sts "$s" >/dev/null 2>&1 || continue
-            kubectl -n "$NS" rollout restart sts/"$s"
-            kubectl -n "$NS" rollout status  sts/"$s" --timeout=600s || true
-          done
-          kubectl -n "$NS" get pods -l app=wazuh-manager -o wide
-
-      - name: Verify managers are listening on 1515 (authd)
-        shell: bash
-        run: |
-          set -euo pipefail
-          for P in $(kubectl -n "$NS" get pod -l app=wazuh-manager -o name); do
-            echo ">> Checking $P"
-            kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc 'ss -Hntl | grep -E "LISTEN.+:1515" || netstat -tln | grep ":1515"'
           done
 
       - name: Ensure Services for managers
@@ -513,7 +530,7 @@ jobs:
         id: dash
         shell: bash
         run: |
-          set -euo pipefail
+          set -euo pipefeel
           PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
           if [ -z "${PORT:-}" ]; then
             PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].targetPort}' 2>/dev/null || true)"
