@@ -296,12 +296,10 @@ jobs:
           set -euo pipefail
           PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
 
-          # Single source of truth: this Secret's value must match the agents' Secret below.
           kubectl -n "$NS" create secret generic wazuh-authd-pass \
             --from-literal=authd.pass="$PASS" \
             -o yaml --dry-run=client | kubectl apply -f -
 
-          # Patch master/worker StatefulSets to mount the file at /var/ossec/etc/authd.pass
           patch_sts () {
             local sts="$1"
             kubectl -n "$NS" get sts "$sts" >/dev/null 2>&1 || return 0
@@ -330,7 +328,6 @@ jobs:
           set -euo pipefail
           PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
 
-          # Agents use this Secret via env: ENROLL_PASS (and it MUST match wazuh-authd-pass above)
           kubectl -n "$NS" create secret generic wazuh-enroll-pass \
             --from-literal=enroll_pass="$PASS" \
             --dry-run=client -o yaml | kubectl apply -f -
@@ -453,10 +450,10 @@ jobs:
                           fi
                         }
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          for i in $(seq 1 18); do
+                          for i in $(seq 1 36); do
                             if enroll; then break; fi
-                            echo "Enroll attempt $i failed; retrying in 10s…"
-                            sleep 10
+                            echo "Enroll attempt $i failed; retrying in 5s…"
+                            sleep 5
                           done
                         fi
                         if [ ! -s /var/ossec/etc/client.keys ]; then
@@ -499,6 +496,29 @@ jobs:
           EOF
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
+
+      - name: 🔎 Sanity-check enrollment password (hash compare)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Comparing agent Secret vs manager file vs agent env (hashes only)…"
+          S1="$(kubectl -n "$NS" get secret wazuh-enroll-pass -o jsonpath='{.data.enroll_pass}' | base64 -d | sha256sum | awk '{print $1}')"
+          S2="$(kubectl -n "$NS" get secret wazuh-authd-pass  -o jsonpath='{.data.authd\.pass}' | base64 -d | sha256sum | awk '{print $1}')"
+          MPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=master -o jsonpath='{.items[0].metadata.name}')"
+          APOD="$(kubectl -n "$NS" get pod -l app=wazuh-agent -o jsonpath='{.items[0].metadata.name}')"
+          F1="$(kubectl -n "$NS" exec "$MPOD" -c wazuh-manager -- sh -lc 'sha256sum /var/ossec/etc/authd.pass | awk "{print \\$1}"' || true)"
+          E1="$(kubectl -n "$NS" exec "$APOD" -- sh -lc 'printf "%s" "$ENROLL_PASS" | sha256sum | awk "{print \\$1}"' || true)"
+
+          echo "hash(secret agent)  = $S1"
+          echo "hash(secret manager)= $S2"
+          echo "hash(manager file)  = $F1"
+          echo "hash(agent env)     = $E1"
+
+          if [ "$S1" != "$S2" ] || [ "$S1" != "$F1" ] || [ "$S1" != "$E1" ]; then
+            echo "::error::Password mismatch detected between secrets/file/env. Ensure WAZUH_ENROLL_PASS secret is set consistently."; exit 1
+          else
+            echo "✅ All hashes match."
+          fi
 
       - name: Discover Dashboard port
         id: dash
