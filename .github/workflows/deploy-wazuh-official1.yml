@@ -115,7 +115,6 @@ jobs:
                         mkdir -p /host-etc/sysctl.d
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
                         echo "node: $(hostname) vm.max_map_count=$(cat /host-proc/sys/vm/max_map_count)"
-                        # keep container up so value persists/visible during run
                         sleep 3600
                     volumeMounts:
                       - { name: host-proc, mountPath: /host-proc }
@@ -225,34 +224,28 @@ jobs:
           kubectl kustomize "${{ steps.resolve.outputs.overlay_path }}" > /tmp/wazuh-all.yaml
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
-      # NEW: Make passwordless the template (before apply)
+      # --- FIXED: only touch ConfigMaps that actually contain data.ossec.conf ---
       - name: Enforce passwordless <auth> in manager ConfigMaps (pre-apply)
         shell: bash
         run: |
           set -euo pipefail
-          OUT=/tmp/wazuh-all.yaml
-          # For every ConfigMap that has data.ossec.conf, rewrite the <auth> block:
-          # - use_password=no
-          # - port=1515
-          # - remove inline <password>...</password>
+          FILE=/tmp/wazuh-all.yaml
           yq -i '
-            (select(.kind=="ConfigMap" and .data."ossec.conf")
-             | .data."ossec.conf") as $oc
-            | .data."ossec.conf" =
-                (($oc
-                  | sub("(?s)(<auth>)(.*?)(</auth>)";
-                        . as $all
-                        | capture("(?s)(?<open><auth>)(?<body>.*?)(?<close></auth>)") as $m
-                        | ($m.body
-                            | sub("<use_password>[^<]+</use_password>"; "<use_password>no</use_password>")
-                            | sub("<port>[^<]+</port>"; "<port>1515</port>")
-                            | sub("(?s)[[:space:]]*<password>[^<]*</password>[[:space:]]*"; "")
-                          ) as $nb
-                        | "\($m.open)\($nb)\($m.close)"
-                       )
-                 )
+            (. | select(.kind=="ConfigMap" and has("data") and .data."ossec.conf")) |=
+            (.data."ossec.conf" =
+              (.data."ossec.conf"
+                | sub("(?s)(<auth>)(.*?)(</auth>)";
+                      capture("(?s)(?<open><auth>)(?<body>.*?)(?<close></auth>)") as $m
+                      | ($m.body
+                          | sub("<use_password>[^<]+</use_password>"; "<use_password>no</use_password>")
+                          | sub("<port>[^<]+</port>"; "<port>1515</port>")
+                          | sub("(?s)[[:space:]]*<password>[^<]*</password>[[:space:]]*"; "")
+                        ) as $nb
+                      | "\($m.open)\($nb)\($m.close)"
                 )
-          ' "$OUT"
+              )
+            )
+          ' "$FILE"
 
       - name: Remove auth password Secret mounts (passwordless)
         shell: bash
@@ -313,7 +306,7 @@ jobs:
             kubectl -n "$NS" apply -f /tmp/wazuh-sts.yaml
           fi
 
-      # NEW: add a best-effort init guard so pods enforce passwordless on boot
+      # guard so managers boot passwordless even if anything re-templates
       - name: Add initContainer guard to managers (force passwordless on boot)
         shell: bash
         run: |
@@ -334,7 +327,7 @@ jobs:
                       - |
                         set -e
                         f=/var/ossec/etc/ossec.conf
-                        [ -f "$f" ] || { echo "no ossec.conf yet"; exit 0; }
+                        [ -f "$f" ] || exit 0
                         awk '"'"'
                           BEGIN{in=0}
                           /<auth>/{in=1}
