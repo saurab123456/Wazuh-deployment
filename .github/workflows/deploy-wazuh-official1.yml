@@ -4,29 +4,34 @@ on:
   workflow_dispatch:
     inputs:
       overlay:
-        description: "Overlay to deploy (single or production) [ignored if repo uses single root kustomization]"
+        description: Overlay to deploy (single or production) [ignored if repo uses single root kustomization]
         required: true
-        default: "single"
+        default: single
       wazuh_tag:
-        description: "wazuh-kubernetes repo tag (e.g., v4.12.0)"
+        description: wazuh-kubernetes repo tag (e.g., v4.12.0)
         required: true
-        default: "v4.12.0"
+        default: v4.12.0
       cleanup_unbound_pvcs:
-        description: "Delete UNBOUND PVCs before deploy (true/false)"
+        description: Delete UNBOUND PVCs before deploy (true/false)
         required: true
         default: "true"
       local_forward_port:
-        description: "Local port for port-forward"
+        description: Local port for port-forward
         required: true
         default: "8444"
       enable_port_forward:
-        description: "Start port-forward automatically (true/false)"
+        description: Start port-forward automatically (true/false)
         required: true
         default: "true"
 
 jobs:
   deploy:
-    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
+    runs-on:
+      - self-hosted
+      - linux
+      - ronin
+      - k8s
+      - control-plane
     timeout-minutes: 180
 
     env:
@@ -63,8 +68,9 @@ jobs:
           yq --version
 
       - name: Write kubeconfig from secret
-        env: { KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }} }
         shell: bash
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
           set -e
           test -n "$KUBE_CONFIG_B64" || { echo "::error::Secret KUBE_CONFIG_B64 missing"; exit 1; }
@@ -84,18 +90,28 @@ jobs:
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
           apiVersion: apps/v1
           kind: DaemonSet
-          metadata: { name: wazuh-sysctl, namespace: kube-system, labels: { app: wazuh-sysctl } }
+          metadata:
+            name: wazuh-sysctl
+            namespace: kube-system
+            labels:
+              app: wazuh-sysctl
           spec:
-            selector: { matchLabels: { app: wazuh-sysctl } }
+            selector:
+              matchLabels:
+                app: wazuh-sysctl
             template:
-              metadata: { labels: { app: wazuh-sysctl } }
+              metadata:
+                labels:
+                  app: wazuh-sysctl
               spec:
                 hostPID: true
-                tolerations: [ { operator: "Exists" } ]
+                tolerations:
+                  - operator: "Exists"
                 containers:
                   - name: sysctl
                     image: busybox:1.36
-                    securityContext: { privileged: true }
+                    securityContext:
+                      privileged: true
                     command: ["/bin/sh","-c"]
                     args:
                       - |
@@ -106,11 +122,19 @@ jobs:
                         echo "now: $(cat /host-proc/sys/vm/max_map_count)"
                         sleep 30
                     volumeMounts:
-                      - { name: host-proc, mountPath: /host-proc }
-                      - { name: host-etc,  mountPath: /host-etc  }
+                      - name: host-proc
+                        mountPath: /host-proc
+                      - name: host-etc
+                        mountPath: /host-etc
                 volumes:
-                  - { name: host-proc, hostPath: { path: /proc, type: Directory } }
-                  - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
+                  - name: host-proc
+                    hostPath:
+                      path: /proc
+                      type: Directory
+                  - name: host-etc
+                    hostPath:
+                      path: /etc
+                      type: Directory
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
           kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
@@ -130,7 +154,8 @@ jobs:
           cat <<EOF | kubectl apply -f -
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
-          metadata: { name: wazuh-storage }
+          metadata:
+            name: wazuh-storage
           provisioner: ${TARGET_PROV}
           reclaimPolicy: Delete
           volumeBindingMode: WaitForFirstConsumer
@@ -210,7 +235,6 @@ jobs:
           kubectl kustomize "${{ steps.resolve.outputs.overlay_path }}" > /tmp/wazuh-all.yaml
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
-      # Remove any password mounts/env (we're passwordless)
       - name: Remove auth password Secret mounts (passwordless)
         shell: bash
         run: |
@@ -272,8 +296,9 @@ jobs:
 
       # ===== Managers: enable AUTHD passwordless (NO in-pod restart) =====
       - name: Enable authd (passwordless) on ALL managers (no in-pod restart)
-        env: { MANAGER_SELECTOR: app=wazuh-manager }
         shell: bash
+        env:
+          MANAGER_SELECTOR: app=wazuh-manager
         run: |
           set -euo pipefail
           PODS=$(kubectl -n "$NS" get pods -l "$MANAGER_SELECTOR" -o name)
@@ -284,14 +309,12 @@ jobs:
               set -e
               CONF=/var/ossec/etc/ossec.conf
               cp -f "$CONF" "${CONF}.bak.$(date +%s)" || true
-              # Ensure <auth> exists/passwordless/1515 and strip any <password> entry
               if grep -q "<auth>" "$CONF"; then
                 sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
                 awk '"'"'BEGIN{in_auth=0} /<auth>/{in_auth=1} in_auth && /<password>.*<\/password>/{next} /<\/auth>/{in_auth=0} {print}'"'"' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
               else
                 awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>no</use_password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
-              # Ensure <remote> block exists for 1514/tcp events
               if grep -q "<remote>" "$CONF"; then
                 sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
               else
@@ -322,28 +345,41 @@ jobs:
           kind: Service
           metadata:
             name: wazuh-authd-master
-            labels: { app: wazuh-manager, node-type: master }
+            labels:
+              app: wazuh-manager
+              node-type: master
           spec:
             type: ClusterIP
-            selector: { app: wazuh-manager, node-type: master }
+            selector:
+              app: wazuh-manager
+              node-type: master
             ports:
-              - { name: authd, port: 1515, targetPort: 1515, protocol: TCP }
+              - name: authd
+                port: 1515
+                targetPort: 1515
+                protocol: TCP
           ---
           apiVersion: v1
           kind: Service
           metadata:
             name: wazuh-workers
-            labels: { app: wazuh-manager, role: agents-events }
+            labels:
+              app: wazuh-manager
+              role: agents-events
           spec:
             type: ClusterIP
-            selector: { app: wazuh-manager, node-type: worker }
+            selector:
+              app: wazuh-manager
+              node-type: worker
             ports:
-              - { name: agents-events, port: 1514, targetPort: 1514, protocol: TCP }
+              - name: agents-events
+                port: 1514
+                targetPort: 1514
+                protocol: TCP
           EOF
           kubectl -n "$NS" get svc -o wide
           kubectl -n "$NS" get endpoints -o wide
 
-      # === Agent side (passwordless enrollment to master-only service) ===
       - name: Create Agent ConfigMap (passwordless enrollment)
         shell: bash
         run: |
@@ -367,9 +403,7 @@ jobs:
             </client>
           </ossec_config>
           EOF
-          kubectl -n "$NS" create configmap wazuh-agent-ossec \
-            --from-file=ossec.conf=/tmp/agent-ossec.conf \
-            -o yaml --dry-run=client | kubectl apply -f -
+          kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
 
       - name: Deploy Agent DaemonSet (agent-auth without -P)
         shell: bash
@@ -381,28 +415,42 @@ jobs:
           kind: DaemonSet
           metadata:
             name: wazuh-agent
-            labels: { app: wazuh-agent }
+            labels:
+              app: wazuh-agent
           spec:
-            selector: { matchLabels: { app: wazuh-agent } }
-            updateStrategy: { type: RollingUpdate }
+            selector:
+              matchLabels:
+                app: wazuh-agent
+            updateStrategy:
+              type: RollingUpdate
             template:
-              metadata: { labels: { app: wazuh-agent } }
+              metadata:
+                labels:
+                  app: wazuh-agent
               spec:
                 hostNetwork: true
                 hostPID: true
                 dnsPolicy: ClusterFirstWithHostNet
                 terminationGracePeriodSeconds: 30
                 tolerations:
-                  - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
-                  - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
+                  - key: node-role.kubernetes.io/master
+                    operator: Exists
+                    effect: NoSchedule
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: Exists
+                    effect: NoSchedule
                 containers:
                   - name: wazuh-agent
                     image: ghcr.io/saurab123456/wazuh-agent:4.12.0
                     imagePullPolicy: IfNotPresent
-                    securityContext: { privileged: true, runAsUser: 0 }
+                    securityContext:
+                      privileged: true
+                      runAsUser: 0
                     env:
                       - name: NODE_NAME
-                        valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: spec.nodeName
                       - name: AUTHD_PORT
                         value: "1515"
                       - name: MANAGER_DNS
@@ -442,38 +490,64 @@ jobs:
                       /var/ossec/bin/wazuh-control status
                       tail -f /var/ossec/logs/ossec.log
                     readinessProbe:
-                      exec: { command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"'] }
+                      exec:
+                        command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"']
                       initialDelaySeconds: 30
                       periodSeconds: 10
                       failureThreshold: 6
                       timeoutSeconds: 5
                     livenessProbe:
-                      exec: { command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"'] }
+                      exec:
+                        command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"']
                       initialDelaySeconds: 60
                       periodSeconds: 30
                       failureThreshold: 3
                       timeoutSeconds: 5
                     lifecycle:
                       preStop:
-                        exec: { command: ["/bin/sh","-c","/var/ossec/bin/wazuh-control stop || true"] }
+                        exec:
+                          command: ["/bin/sh","-c","/var/ossec/bin/wazuh-control stop || true"]
                     resources:
-                      requests: { cpu: "100m", memory: "256Mi" }
-                      limits:   { cpu: "1000m", memory: "1024Mi" }
+                      requests:
+                        cpu: "100m"
+                        memory: "256Mi"
+                      limits:
+                        cpu: "1000m"
+                        memory: "1024Mi"
                     volumeMounts:
-                      - { name: ossec-conf-cm,   mountPath: /config,                    readOnly: true }
-                      - { name: varlogcontainers, mountPath: /host/var/log/containers,   readOnly: true }
-                      - { name: varlogpods,       mountPath: /host/var/log/pods,         readOnly: true }
-                      - { name: varlog,           mountPath: /host/var/log,              readOnly: true }
+                      - name: ossec-conf-cm
+                        mountPath: /config
+                        readOnly: true
+                      - name: varlogcontainers
+                        mountPath: /host/var/log/containers
+                        readOnly: true
+                      - name: varlogpods
+                        mountPath: /host/var/log/pods
+                        readOnly: true
+                      - name: varlog
+                        mountPath: /host/var/log
+                        readOnly: true
                 volumes:
-                  - { name: ossec-conf-cm,   configMap: { name: wazuh-agent-ossec } }
-                  - { name: varlogcontainers, hostPath: { path: /var/log/containers, type: DirectoryOrCreate } }
-                  - { name: varlogpods,       hostPath: { path: /var/log/pods,       type: DirectoryOrCreate } }
-                  - { name: varlog,           hostPath: { path: /var/log,            type: Directory } }
+                  - name: ossec-conf-cm
+                    configMap:
+                      name: wazuh-agent-ossec
+                  - name: varlogcontainers
+                    hostPath:
+                      path: /var/log/containers
+                      type: DirectoryOrCreate
+                  - name: varlogpods
+                    hostPath:
+                      path: /var/log/pods
+                      type: DirectoryOrCreate
+                  - name: varlog
+                    hostPath:
+                      path: /var/log
+                      type: Directory
           EOF
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
 
-      - name: ✅ Probe authd (1515) via master-only Service
+      - name: Probe authd (1515) via master-only Service
         shell: bash
         run: |
           set -euo pipefail
@@ -498,10 +572,10 @@ jobs:
 
       - name: Start Dashboard port-forward (auto)
         if: ${{ inputs.enable_port_forward == 'true' }}
+        shell: bash
         env:
           PF_BIND: 127.0.0.1
           PF_PORT: ${{ inputs.local_forward_port }}
-        shell: bash
         run: |
           set -euo pipefail
           TARGET_PORT="${{ steps.dash.outputs.dash_port }}"
