@@ -276,29 +276,54 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # ===== NEW: Patch manager ConfigMaps so passwordless persists across restarts =====
-      - name: Make manager ConfigMaps passwordless (source of truth)
+      # ===== Patch the EXACT ConfigMaps used by running manager pods (your flow) =====
+      - name: Patch manager ossec.conf in live ConfigMaps (passwordless)
         shell: bash
         run: |
           set -euo pipefail
           NS="${NS:-wazuh}"
-          CMLS="$(kubectl -n "$NS" get sts -l app=wazuh-manager \
-            -o jsonpath='{range .items[*].spec.template.spec.volumes[*]}{.configMap.name}{"\n"}{end}' | sort -u | sed '/^$/d' || true)"
-          if [ -z "${CMLS}" ]; then
-            echo "::warning::No ConfigMaps referenced by manager StatefulSets were found."
+
+          # Collect CM names from BOTH Pods and StatefulSets, then uniq
+          CM_NAMES="$(
+            { kubectl -n "$NS" get pods -l app=wazuh-manager \
+                -o jsonpath='{range .items[*].spec.volumes[*]}{.configMap.name}{"\n"}{end}';
+              kubectl -n "$NS" get sts -l app=wazuh-manager \
+                -o jsonpath='{range .items[*].spec.template.spec.volumes[*]}{.configMap.name}{"\n"}{end}';
+            } 2>/dev/null | sort -u | sed '/^$/d' || true
+          )"
+
+          if [ -z "$CM_NAMES" ]; then
+            echo "::error::No ConfigMaps referenced by wazuh-manager pods/STS were found."
+            exit 1
           fi
-          for CM in $CMLS; do
-            DATA="$(kubectl -n "$NS" get cm "$CM" -o jsonpath='{.data.ossec\.conf}' 2>/dev/null || true)"
-            if [ -n "$DATA" ] && echo "$DATA" | grep -q '<auth>'; then
-              echo "Patching ConfigMap: $CM"
-              kubectl -n "$NS" get cm "$CM" -o yaml \
-              | perl -0777 -pe 's#(<auth>.*?<port>)[0-9]+(</port>.*?<use_password>)[^<]+(</use_password>.*?</auth>)#${1}1515${2}no${3}#gs' \
-              | kubectl apply -f -
+
+          for CM in $CM_NAMES; do
+            echo ">> Processing ConfigMap: $CM"
+            # Fetch full CM YAML so we preserve labels/annotations
+            kubectl -n "$NS" get cm "$CM" -o yaml > "/tmp/${CM}.yaml"
+
+            # Extract ossec.conf to a temp file
+            if ! yq -r '.data."ossec.conf"' "/tmp/${CM}.yaml" > "/tmp/ossec.conf.cm"; then
+              echo "::warning::${CM} has no data.ossec.conf; skipping"
+              continue
             fi
+
+            # Apply your sed/awk patch exactly within <auth>…</auth>
+            sed -i -E '/<auth>/,/<\/auth>/ s|<use_password>[^<]+</use_password>|<use_password>no</use_password>|' /tmp/ossec.conf.cm
+            sed -i -E '/<auth>/,/<\/auth>/ s|<port>[0-9]+</port>|<port>1515</port>|' /tmp/ossec.conf.cm
+            awk 'BEGIN{in=0} /<auth>/{in=1} in && /<password>.*<\/password>/{next} /<\/auth>/{in=0} {print}' /tmp/ossec.conf.cm > /tmp/ossec.conf.cm.new && mv /tmp/ossec.conf.cm.new /tmp/ossec.conf.cm
+
+            # Put it back into the CM and apply
+            yq -i '.data."ossec.conf" = load_str("/tmp/ossec.conf.cm")' "/tmp/${CM}.yaml"
+            kubectl -n "$NS" apply -f "/tmp/${CM}.yaml"
+
+            # Quick visibility of the <auth> block after patch
+            awk 'BEGIN{in=0} /<auth>/{in=1} in{print} /<\/auth>/{in=0}' /tmp/ossec.conf.cm
+            echo
           done
 
-      # ===== Your requested in-pod patch (immediate) + purge authd.pass =====
-      - name: Force passwordless on ALL managers (sed patch + purge authd.pass)
+      # ===== Immediate in-pod patch & purge authd.pass (so agents can enroll now) =====
+      - name: Force passwordless on ALL managers (in-pod sed + purge authd.pass)
         shell: bash
         run: |
           set -euo pipefail
@@ -318,7 +343,7 @@ jobs:
             '
           done
 
-      - name: Rollout restart manager StatefulSets (apply passwordless)
+      - name: Rollout restart manager StatefulSets (apply passwordless from CM)
         shell: bash
         run: |
           set -e
@@ -327,7 +352,7 @@ jobs:
             kubectl -n "$NS" rollout restart sts/"$s"
             kubectl -n "$NS" rollout status  sts/"$s" --timeout=600s
           done
-          echo "Verify auth blocks:"
+          echo "Verify <auth> blocks in running pods:"
           for P in $(kubectl -n "$NS" get pods -l app=wazuh-manager -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
             echo "=== $P ==="
             kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc 'sed -n "/<auth>/,/<\\/auth>/p" /var/ossec/etc/ossec.conf'
