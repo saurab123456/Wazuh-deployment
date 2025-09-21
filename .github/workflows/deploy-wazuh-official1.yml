@@ -146,24 +146,18 @@ jobs:
           git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
           ls -la wazuh-kubernetes | sed -n '1,120p'
 
-      # ======== RESOLVE OVERLAY (works with your repo layout) ========
+      # ======== RESOLVE OVERLAY (matches your repo layout) ========
       - name: Resolve overlay path (auto-detect)
         id: resolve
         run: |
           set -euo pipefail
           ROOT="wazuh-kubernetes/wazuh"
-
-          echo "Tree under $ROOT:"
-          ls -la "$ROOT" | sed -n '1,200p' || true
-
-          # Prefer the top-level kustomization directly under wazuh/
+          echo "Tree under $ROOT:"; ls -la "$ROOT" | sed -n '1,200p' || true
           if [ -f "$ROOT/kustomization.yml" ] || [ -f "$ROOT/kustomization.yaml" ]; then
             PICK="$ROOT"
           else
-            # Fallback: find any kustomization.{yml,yaml}
             PICK="$(find "$ROOT" -type f \( -name 'kustomization.yml' -o -name 'kustomization.yaml' \) -printf '%h\n' | sort -u | head -n1 || true)"
           fi
-
           test -n "${PICK:-}" || { echo "::error::Could not find any kustomize overlays under $ROOT"; exit 1; }
           echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
           echo "Resolved overlay_path=$PICK"
@@ -177,7 +171,6 @@ jobs:
           IC="${CERTROOT}/indexer_cluster"
           DH="${CERTROOT}/dashboard_http"
           mkdir -p "$IC" "$DH"
-
           cat > /tmp/wazuh-openssl.cnf <<'CONF'
           [req]
           default_bits=2048
@@ -200,10 +193,8 @@ jobs:
           DNS.5 = localhost
           IP.1  = 127.0.0.1
           CONF
-
           openssl genrsa -out "$IC/root-ca-key.pem" 4096
           openssl req -x509 -new -key "$IC/root-ca-key.pem" -sha256 -days 3650 -out "$IC/root-ca.pem" -subj "/CN=Wazuh Root CA"
-
           sign_ic() {
             local name="$1"
             openssl genrsa -out "$IC/${name}-key.pem" 2048
@@ -212,7 +203,6 @@ jobs:
             rm -f "$IC/${name}.csr"
           }
           for n in admin dashboard node filebeat; do sign_ic "$n"; done
-
           openssl genrsa -out "$DH/key.pem" 2048
           openssl req -new -key "$DH/key.pem" -out "$DH/dashboard.csr" -config /tmp/wazuh-openssl.cnf
           openssl x509 -req -in "$DH/dashboard.csr" -CA "$IC/root-ca.pem" -CAkey "$IC/root-ca-key.pem" -CAcreateserial -out "$DH/cert.pem" -days 825 -sha256 -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
@@ -268,8 +258,7 @@ jobs:
           MANAGER_SELECTOR: app=wazuh-manager
         run: |
           set -euo pipefail
-          PASS="${WAZUH_ENROLL_PASS:-}"
-          if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+          PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
           PODS=$(kubectl -n "$NS" get pods -l "$MANAGER_SELECTOR" -o name)
           test -n "$PODS" || { echo "No manager pods found"; exit 1; }
           for POD in $PODS; do
@@ -306,11 +295,11 @@ jobs:
           done
           kubectl -n "$NS" get pods -l app=wazuh-manager -o wide
 
-      - name: Ensure Agent ConfigMap (enrollment with password) and restart agents
+      # --------- Agent ConfigMap (optional content) ---------
+      - name: Ensure Agent ConfigMap (enrollment with password) 
         run: |
           set -euo pipefail
-          PASS="${WAZUH_ENROLL_PASS:-}"
-          if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+          PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
           cat > /tmp/agent-ossec.conf <<EOF
           <ossec_config>
             <client>
@@ -332,12 +321,65 @@ jobs:
           </ossec_config>
           EOF
           kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
-          if kubectl -n "$NS" get ds/wazuh-agent >/dev/null 2>&1; then
-            kubectl -n "$NS" rollout restart ds/wazuh-agent
-            kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
-          fi
-          kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
 
+      # --------- CRITICAL FIX: make agent-auth use the password ---------
+      - name: Patch agent DaemonSet to pass ENROLL_PASS to agent-auth
+        run: |
+          set -euo pipefail
+          PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+          DS="wazuh-agent"
+          # Identify container name (usually 'wazuh-agent')
+          CNAME="$(kubectl -n "$NS" get ds "$DS" -o jsonpath='{.spec.template.spec.containers[0].name}')"
+          echo "Patching DaemonSet/$DS container=$CNAME to call agent-auth with -P"
+          kubectl -n "$NS" patch ds "$DS" --type=strategic -p "
+          spec:
+            template:
+              spec:
+                containers:
+                - name: ${CNAME}
+                  env:
+                  - name: ENROLL_PASS
+                    value: \"${PASS}\"
+                  command: [\"/bin/sh\",\"-c\"]
+                  args:
+                  - |
+                    set -e
+                    AGENT_NAME=\"\${NODE_NAME}\"
+                    echo \"Agent name: \$AGENT_NAME\"
+                    mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
+                    cp /config/ossec.conf /var/ossec/etc/ossec.conf 2>/dev/null || true
+                    rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+                    enroll() {
+                      echo \"Enrolling to \${MANAGER_DNS}:1515 (group=\${GROUPS})…\"
+                      if [ -n \"\${GROUPS}\" ]; then
+                        /var/ossec/bin/agent-auth -m \"\${MANAGER_DNS}\" -p 1515 -A \"\${AGENT_NAME}\" -G \"\${GROUPS}\" -P \"\${ENROLL_PASS}\"
+                      else
+                        /var/ossec/bin/agent-auth -m \"\${MANAGER_DNS}\" -p 1515 -A \"\${AGENT_NAME}\" -P \"\${ENROLL_PASS}\"
+                      fi
+                    }
+                    if [ ! -s /var/ossec/etc/client.keys ]; then
+                      for i in \$(seq 1 18); do
+                        if enroll; then break; fi
+                        echo \"Enroll attempt \$i failed; retrying in 10s…\"
+                        sleep 10
+                      done
+                    fi
+                    if [ ! -s /var/ossec/etc/client.keys ]; then
+                      echo \"ERROR: Enrollment failed; exiting.\"
+                      exit 1
+                    fi
+                    echo \"Starting Wazuh agent…\"
+                    /var/ossec/bin/wazuh-control start
+                    sleep 5
+                    /var/ossec/bin/wazuh-control status
+                    tail -f /var/ossec/logs/ossec.log
+          "
+
+          kubectl -n "$NS" rollout restart ds "$DS"
+          kubectl -n "$NS" rollout status ds "$DS" --timeout=600s || true
+          kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
+
+      # ---------- Discover dashboard port & port-forward ----------
       - name: Discover Dashboard port
         id: dash
         run: |
