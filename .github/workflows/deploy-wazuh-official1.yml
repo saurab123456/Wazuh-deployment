@@ -295,6 +295,70 @@ jobs:
           done
           kubectl -n "$NS" get pods -l app=wazuh-manager -o wide
 
+      # ---------- NEW: Cluster Secret for enrollment password ----------
+      - name: Ensure Wazuh enrollment Secret
+        run: |
+          set -euo pipefail
+          PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+          kubectl -n "$NS" create secret generic wazuh-enroll-pass \
+            --from-literal=enroll_pass="$PASS" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          echo "Enrollment password stored in Secret 'wazuh-enroll-pass'"
+          echo "Decoded password:" 
+          kubectl -n "$NS" get secret wazuh-enroll-pass -o jsonpath='{.data.enroll_pass}' | base64 -d || true
+          echo
+
+      # ---------- NEW: NodePort for external VMs to enroll & send events ----------
+      - name: Expose Manager ports for external agents (NodePort)
+        run: |
+          set -euo pipefail
+          cat <<'EOF' | kubectl -n "$NS" apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: wazuh-manager-nodeport
+            labels:
+              app: wazuh-manager
+          spec:
+            type: NodePort
+            selector:
+              app: wazuh-manager
+              node-type: master
+            ports:
+              - name: authd
+                port: 1515
+                targetPort: 1515
+                nodePort: 31515
+                protocol: TCP
+              - name: agents-events
+                port: 1514
+                targetPort: 1514
+                nodePort: 31514
+                protocol: TCP
+          EOF
+          NODE_IP="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' | head -n1)"
+          echo "=========================================="
+          echo " External agents (VMs) configuration"
+          echo "  Enrollment/authd:  ${NODE_IP}:31515"
+          echo "  Events (remoted):  ${NODE_IP}:31514"
+          echo
+          echo " Example ossec.conf on external VM:"
+          echo "<client>"
+          echo "  <server>"
+          echo "    <address>${NODE_IP}</address>"
+          echo "    <port>1514</port>"
+          echo "    <protocol>tcp</protocol>"
+          echo "  </server>"
+          echo "  <enrollment>"
+          echo "    <enabled>yes</enabled>"
+          echo "    <manager_address>${NODE_IP}</manager_address>"
+          echo "    <port>1515</port>"
+          echo "    <use_password>yes</use_password>"
+          echo "    <password>$(kubectl -n $NS get secret wazuh-enroll-pass -o jsonpath='{.data.enroll_pass}' | base64 -d)</password>"
+          echo "  </enrollment>"
+          echo "</client>"
+          echo "=========================================="
+
       # --------- Agent ConfigMap (optional content) ---------
       - name: Ensure Agent ConfigMap (enrollment with password) 
         run: |
@@ -328,7 +392,6 @@ jobs:
           set -euo pipefail
           PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
           DS="wazuh-agent"
-          # Identify container name (usually 'wazuh-agent')
           CNAME="$(kubectl -n "$NS" get ds "$DS" -o jsonpath='{.spec.template.spec.containers[0].name}')"
           echo "Patching DaemonSet/$DS container=$CNAME to call agent-auth with -P"
           kubectl -n "$NS" patch ds "$DS" --type=strategic -p "
@@ -374,7 +437,6 @@ jobs:
                     /var/ossec/bin/wazuh-control status
                     tail -f /var/ossec/logs/ossec.log
           "
-
           kubectl -n "$NS" rollout restart ds "$DS"
           kubectl -n "$NS" rollout status ds "$DS" --timeout=600s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
