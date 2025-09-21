@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       overlay:
-        description: "Overlay to deploy (single or production)"
+        description: "Overlay to deploy (single or production) [ignored if repo uses single root kustomization]"
         required: true
         default: "single"
       wazuh_tag:
@@ -36,7 +36,6 @@ jobs:
       OVERLAY_CHOICE: ${{ inputs.overlay }}
       CLEANUP_UNBOUND_PVCS: ${{ inputs.cleanup_unbound_pvcs }}
       LOCAL_FORWARD_PORT: ${{ inputs.local_forward_port }}
-      # Prefer secret; fall back to the password you asked for
       WAZUH_ENROLL_PASS: ${{ secrets.WAZUH_ENROLL_PASS }}
       WAZUH_ENROLL_PASS_FALLBACK: "A@min@123"
 
@@ -147,62 +146,28 @@ jobs:
           git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
           ls -la wazuh-kubernetes | sed -n '1,120p'
 
-      # ========= FIXED STEP =========
+      # ======== RESOLVE OVERLAY (works with your repo layout) ========
       - name: Resolve overlay path (auto-detect)
         id: resolve
         run: |
           set -euo pipefail
-          WANT="${OVERLAY_CHOICE}"
           ROOT="wazuh-kubernetes/wazuh"
 
-          echo "Repo tree (top level):"
-          ls -la wazuh-kubernetes | sed -n '1,120p' || true
-          echo "Repo tree ($ROOT):"
+          echo "Tree under $ROOT:"
           ls -la "$ROOT" | sed -n '1,200p' || true
 
-          CANDIDATES=""
-
-          # Preferred well-known overlays
-          if [ -d "$ROOT/single-node" ]; then
-            CANDIDATES="${CANDIDATES}"$'\n'"$ROOT/single-node"
-          fi
-          if [ -d "$ROOT/production" ]; then
-            CANDIDATES="${CANDIDATES}"$'\n'"$ROOT/production"
+          # Prefer the top-level kustomization directly under wazuh/
+          if [ -f "$ROOT/kustomization.yml" ] || [ -f "$ROOT/kustomization.yaml" ]; then
+            PICK="$ROOT"
+          else
+            # Fallback: find any kustomization.{yml,yaml}
+            PICK="$(find "$ROOT" -type f \( -name 'kustomization.yml' -o -name 'kustomization.yaml' \) -printf '%h\n' | sort -u | head -n1 || true)"
           fi
 
-          # Fallback: any kustomization.yaml inside wazuh/
-          MORE=$(find "$ROOT" -type f -name 'kustomization.yaml' -printf '%h\n' | sort -u || true)
-          if [ -n "$MORE" ]; then
-            CANDIDATES="$(printf "%s\n%s\n" "$CANDIDATES" "$MORE" | awk 'NF' | sort -u)"
-          fi
-
-          if [ -z "$CANDIDATES" ]; then
-            echo "::error::Could not find any kustomize overlays under $ROOT"
-            exit 1
-          fi
-
-          echo "Detected candidate overlays:"
-          echo "$CANDIDATES" | nl -ba
-
-          PICK=""
-          case "$(echo "$WANT" | tr '[:upper:]' '[:lower:]')" in
-            single|single-node)
-              PICK=$(echo "$CANDIDATES" | awk '/single-node/{print; exit}')
-              ;;
-            prod|production)
-              PICK=$(echo "$CANDIDATES" | awk '/production/{print; exit}')
-              ;;
-          esac
-
-          # If not matched, take the first candidate
-          if [ -z "$PICK" ]; then
-            PICK=$(echo "$CANDIDATES" | head -n1)
-          fi
-
-          test -n "$PICK" || { echo "::error::No overlay selected"; exit 1; }
+          test -n "${PICK:-}" || { echo "::error::Could not find any kustomize overlays under $ROOT"; exit 1; }
           echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
           echo "Resolved overlay_path=$PICK"
-      # ========= END FIXED STEP =========
+      # ================== END RESOLVE STEP ==================
 
       # ---------- CERTS ----------
       - name: Generate self-signed certs for Kustomize (indexer + dashboard_http)
@@ -313,8 +278,6 @@ jobs:
               set -e
               CONF=/var/ossec/etc/ossec.conf
               cp -f "$CONF" "${CONF}.bak.$(date +%s)"
-
-              # Ensure <auth> with password, port 1515, enabled
               if grep -q "<auth>" "$CONF"; then
                 sed -i "s#<use_password>.*</use_password>#<use_password>yes</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
                 if grep -q "<password>.*</password>" "$CONF"; then
@@ -325,8 +288,6 @@ jobs:
               else
                 awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>yes</use_password>\\n    <password>'"$PASS"'</password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
-
-              # Keep remote settings sane
               if grep -q "<remote>" "$CONF"; then
                 sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
               else
@@ -345,13 +306,11 @@ jobs:
           done
           kubectl -n "$NS" get pods -l app=wazuh-manager -o wide
 
-      # --------- Agent Config (with password) and restart agent DaemonSet ---------
       - name: Ensure Agent ConfigMap (enrollment with password) and restart agents
         run: |
           set -euo pipefail
           PASS="${WAZUH_ENROLL_PASS:-}"
           if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
-
           cat > /tmp/agent-ossec.conf <<EOF
           <ossec_config>
             <client>
@@ -372,19 +331,13 @@ jobs:
             </client>
           </ossec_config>
           EOF
-
           kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
-
           if kubectl -n "$NS" get ds/wazuh-agent >/dev/null 2>&1; then
             kubectl -n "$NS" rollout restart ds/wazuh-agent
             kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
-          else
-            echo "DaemonSet 'wazuh-agent' not found (skip restart)"; 
           fi
-
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
 
-      # ---------- Discover dashboard port & port-forward (no hardcoded ports) ----------
       - name: Discover Dashboard port
         id: dash
         run: |
@@ -411,7 +364,6 @@ jobs:
           (pkill -f "port-forward .*:${PF_PORT}:" && sleep 1) || true
           echo "Starting PF: localhost:${PF_PORT} -> deploy/wazuh-dashboard:${TARGET_PORT}"
           nohup kubectl -n "${NS}" port-forward --address "${PF_BIND}" deploy/wazuh-dashboard "${PF_PORT}:${TARGET_PORT}" > portforward.log 2>&1 &
-
           for i in $(seq 1 30); do
             sleep 2
             if curl -Is --connect-timeout 2 "http://localhost:${PF_PORT}" >/dev/null 2>&1 || \
