@@ -148,45 +148,55 @@ jobs:
           for pod in $MANAGER_PODS; do
             echo "=== Configuring $pod for passwordless auth ==="
             
-            # Configure ossec.conf for passwordless authentication
-            kubectl -n "$NS" exec "$pod" -- bash -c '
-              set -e
-              CONFIG_FILE="/var/ossec/etc/ossec.conf"
-              BACKUP_FILE="/var/ossec/etc/ossec.conf.backup.$(date +%s)"
-              
-              # Create backup
-              cp "$CONFIG_FILE" "$BACKUP_FILE"
-              
-              # Ensure auth section exists with passwordless config
-              if grep -q "<auth>" "$CONFIG_FILE"; then
-                # Update existing auth section
-                sed -i '\''/<auth>/,/<\/auth>/ {
-                  s/<disabled>.*<\/disabled>/<disabled>no<\/disabled>/
-                  s/<port>.*<\/port>/<port>1515<\/port>/
-                  s/<use_password>.*<\/use_password>/<use_password>no<\/use_password>/
-                  /<password>.*<\/password>/d
-                }'\'' "$CONFIG_FILE"
-              else
-                # Add auth section
-                cat >> "$CONFIG_FILE" <<'\''AUTH_CONFIG'\''
-              
-              <auth>
-                <disabled>no</disabled>
-                <port>1515</port>
-                <use_password>no</use_password>
-              </auth>
-              
+            # Create a script file to execute on the manager pod
+            cat > /tmp/configure_auth.sh <<'SCRIPT_EOF'
+            #!/bin/bash
+            set -e
+            CONFIG_FILE="/var/ossec/etc/ossec.conf"
+            BACKUP_FILE="/var/ossec/etc/ossec.conf.backup.$(date +%s)"
+            
+            # Create backup
+            cp "$CONFIG_FILE" "$BACKUP_FILE"
+            
+            # Ensure auth section exists with passwordless config
+            if grep -q "<auth>" "$CONFIG_FILE"; then
+              # Update existing auth section
+              sed -i '/<auth>/,/<\/auth>/ {
+                s/<disabled>.*<\/disabled>/<disabled>no<\/disabled>/
+                s/<port>.*<\/port>/<port>1515<\/port>/
+                s/<use_password>.*<\/use_password>/<use_password>no<\/use_password>/
+                /<password>.*<\/password>/d
+              }' "$CONFIG_FILE"
+            else
+              # Add auth section
+              cat >> "$CONFIG_FILE" <<'AUTH_CONFIG'
+            
+            <auth>
+              <disabled>no</disabled>
+              <port>1515</port>
+              <use_password>no</use_password>
+            </auth>
+            
 AUTH_CONFIG
-              fi
-              
-              # Verify the configuration
-              echo "=== Current auth configuration ==="
-              sed -n '\''/<auth>/,/<\/auth>/p'\'' "$CONFIG_FILE"
-              
-              # Restart wazuh-manager to apply changes
-              echo "Restarting wazuh-manager..."
-              supervisorctl restart wazuh-manager
-            ' || echo "Warning: Failed to configure $pod"
+            fi
+            
+            # Verify the configuration
+            echo "=== Current auth configuration ==="
+            sed -n '/<auth>/,/<\/auth>/p' "$CONFIG_FILE"
+            
+            # Restart wazuh-manager to apply changes
+            echo "Restarting wazuh-manager..."
+            supervisorctl restart wazuh-manager
+SCRIPT_EOF
+            
+            chmod +x /tmp/configure_auth.sh
+            
+            # Copy and execute the script on the manager pod
+            kubectl -n "$NS" cp /tmp/configure_auth.sh "$pod":/tmp/configure_auth.sh
+            kubectl -n "$NS" exec "$pod" -- /tmp/configure_auth.sh || echo "Warning: Failed to configure $pod"
+            
+            # Clean up
+            rm -f /tmp/configure_auth.sh
           done
           
           # Wait for managers to restart
