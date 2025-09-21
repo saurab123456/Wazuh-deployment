@@ -62,7 +62,7 @@ jobs:
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # ---------- SYSCTL: vm.max_map_count ----------
+      # ---------- SYSCTL ----------
       - name: Set vm.max_map_count on nodes (DaemonSet)
         run: |
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
@@ -178,27 +178,23 @@ jobs:
             fi
           fi
 
-      - name: Apply overlay (skip StorageClass & StatefulSet)
+      - name: Apply overlay (skip StorageClass, StatefulSet, Kustomization)
         run: |
           set -e
           cd "${{ steps.resolve.outputs.overlay_path }}"
           FILES="$(find . -type f \( -name '*.yaml' -o -name '*.yml' \))"
           APPLY_LIST=""
           for f in $FILES; do
-            if grep -qE '^[[:space:]]*kind:[[:space:]]*StorageClass' "$f"; then
-              echo "Skip StorageClass manifest: $f"
-              continue
-            fi
-            if grep -qE '^[[:space:]]*kind:[[:space:]]*StatefulSet' "$f"; then
-              echo "Defer StatefulSet manifest: $f"
-              continue
-            fi
+            # Skip known-problematic kinds and kustomize files
+            if grep -qi '^[[:space:]]*kind:[[:space:]]*StorageClass' "$f"; then echo "Skip StorageClass: $f"; continue; fi
+            if grep -qi '^[[:space:]]*kind:[[:space:]]*StatefulSet'  "$f"; then echo "Defer StatefulSet: $f"; continue; fi
+            if grep -qi '^[[:space:]]*kind:[[:space:]]*Kustomization' "$f" || echo "$f" | grep -qi 'kustomization\.ya\?ml$'; then echo "Skip Kustomization: $f"; continue; fi
             APPLY_LIST="$APPLY_LIST $f"
           done
           if [ -n "$APPLY_LIST" ]; then
             for f in $APPLY_LIST; do kubectl apply -f "$f"; done
           else
-            echo "No non-STS/non-SC manifests to apply."
+            echo "No non-STS/non-SC/non-Kustomization manifests to apply."
           fi
 
       - name: Recreate StatefulSets to avoid immutability errors
@@ -208,9 +204,9 @@ jobs:
           STS_FILES="$(grep -RIl --include='*.yml' --include='*.yaml' '^[[:space:]]*kind:[[:space:]]*StatefulSet' . || true)"
           if [ -n "$STS_FILES" ]; then
             for f in $STS_FILES; do
+              # Extract name safely (fallback to dry-run)
               NAME="$(awk '/^[[:space:]]*metadata:[[:space:]]*$/,/^[^ ]/{if($1=="name:"){print $2; exit}}' "$f")"
               if [ -z "$NAME" ]; then
-                # Fallback to kubectl reading name
                 NAME="$(kubectl create --dry-run=client -f "$f" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
               fi
               if [ -n "$NAME" ]; then
