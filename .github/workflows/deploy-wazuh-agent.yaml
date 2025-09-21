@@ -92,10 +92,11 @@ jobs:
             echo "Found worker pod: $WPOD"
           fi
 
-      - name: Normalise manager auth (both nodes) to passwordless (lab)
+      - name: Normalise manager auth (both) to passwordless and restart
         shell: bash
         run: |
           set -euo pipefail
+          . "$GITHUB_ENV" || true
           normalize() {
             local POD="$1"
             [ -z "$POD" ] && return 0
@@ -106,35 +107,39 @@ jobs:
               cp "$FILE" "$FILE.bak" || true
               if grep -q "<use_password>yes</use_password>" "$FILE"; then
                 sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#" "$FILE"
-                supervisorctl restart wazuh-manager || true
+                supervisorctl restart wazuh-manager
               else
                 echo "Already passwordless on $HOSTNAME"
+                supervisorctl restart wazuh-manager || true
               fi
             '
+            # wait for authd to come back
+            for i in {1..20}; do
+              if kubectl -n "$NS" logs "$POD" --tail=200 | egrep -qi 'ossec-authd|Accepting connections on port 1515'; then
+                break
+              fi
+              sleep 2
+            done
           }
-          . "$GITHUB_ENV" || true
           normalize "${MASTER_POD:-}"
           normalize "${WORKER_POD:-}"
 
-      # (Optional) If your GHCR image is private, create once and then uncomment imagePullSecrets below:
-      # kubectl -n wazuh create secret docker-registry ghcr-secret \
-      #   --docker-server=ghcr.io \
-      #   --docker-username=YOUR_GITHUB_USERNAME \
-      #   --docker-password=YOUR_GHCR_PAT
-
-      - name: Confirm manager ports (no config patching)
+      - name: Confirm manager ports
         shell: bash
         run: |
           set -euo pipefail
-          kubectl -n "$NS" logs "$MASTER_POD" --tail=400 || true
-          if [ -n "${WORKER_POD:-}" ]; then kubectl -n "$NS" logs "$WORKER_POD" --tail=200 || true; fi
+          . "$GITHUB_ENV" || true
+          echo "=== Master last lines ==="
+          kubectl -n "$NS" logs "$MASTER_POD" --tail=300 || true
+          if [ -n "${WORKER_POD:-}" ]; then
+            echo "=== Worker last lines ==="
+            kubectl -n "$NS" logs "$WORKER_POD" --tail=200 || true
+          fi
 
-      - name: Apply Services, ConfigMap, and DaemonSet (send events to MASTER first)
+      - name: Apply Services, ConfigMap, and DaemonSet (enroll to MASTER, then flip)
         shell: bash
         run: |
           set -euo pipefail
-          # NOTE: unquoted heredoc so ${IMAGE}, ${AUTHD_PORT} expand on runner.
-          #       Vars meant for the container are escaped as \${...} / \$...
           cat <<EOF | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
@@ -210,8 +215,6 @@ jobs:
                 tolerations:
                   - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
                   - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
-                # imagePullSecrets:
-                #   - name: ghcr-secret
                 containers:
                   - name: wazuh-agent
                     image: ${IMAGE}
@@ -233,9 +236,13 @@ jobs:
                         AGENT_NAME="\${NODE_NAME}"
                         echo "Agent name: \$AGENT_NAME"
 
+                        # copy config
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+
+                        # Clean any stale entry with same name to avoid authd rejection
+                        ( /var/ossec/bin/agent_control -lc 2>/dev/null | grep -q "\$AGENT_NAME" ) && echo "Warning: agent '\$AGENT_NAME' already listed on manager."
 
                         enroll() {
                           echo "Enrolling to \${MANAGER_DNS}:\${AUTHD_PORT} (group=\${GROUPS})…"
@@ -246,12 +253,10 @@ jobs:
                           fi
                         }
 
-                        # Retry enrollment up to 12 times (~2 minutes)
+                        # Retry enrollment up to 18 times
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          for i in \$(seq 1 12); do
-                            if enroll; then
-                              break
-                            fi
+                          for i in \$(seq 1 18); do
+                            if enroll; then break; fi
                             echo "Enroll attempt \$i failed; retrying in 10s…"
                             sleep 10
                           done
@@ -281,10 +286,6 @@ jobs:
                       periodSeconds: 30
                       failureThreshold: 3
                       timeoutSeconds: 5
-                    lifecycle:
-                      preStop:
-                        exec:
-                          command: ["/bin/sh","-c","/var/ossec/bin/wazuh-control stop || true"]
                     resources:
                       requests: { cpu: "100m", memory: "256Mi" }
                       limits:   { cpu: "1000m", memory: "1024Mi" }
@@ -300,23 +301,44 @@ jobs:
                   - { name: varlog,           hostPath: { path: /var/log,            type: Directory } }
           EOF
 
+          # Give the DS a head start; if it stalls, we'll dump logs below
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
+
+      - name: If agents crashing, dump logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad=0
+          for P in $(kubectl -n "$NS" get pods -l app=wazuh-agent -o jsonpath='{.items[*].metadata.name}'); do
+            PHASE=$(kubectl -n "$NS" get pod "$P" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
+            READY=$(kubectl -n "$NS" get pod "$P" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
+            if [ "$READY" != "true" ]; then
+              bad=1
+              echo "==== $P (not ready; phase=$PHASE) ===="
+              kubectl -n "$NS" logs "$P" --previous --tail=200 || true
+              kubectl -n "$NS" logs "$P" --tail=200 || true
+            fi
+          done
+          if [ "$bad" -eq 1 ]; then
+            echo "::warning::Some agent pods are not ready; see logs above."
+          fi
 
       - name: Verify enrollment on manager
         shell: bash
         run: |
           set -euo pipefail
+          . "$GITHUB_ENV" || true
           ok=0
           for i in {1..24}; do
-            KEYS=$(kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc 'wc -l /var/ossec/etc/client.keys | awk "{print \$1}"' || echo 0)
+            KEYS=$(kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc 'test -f /var/ossec/etc/client.keys && wc -l /var/ossec/etc/client.keys | awk "{print \$1}" || echo 0' || echo 0)
             COUNT=$(kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc "/var/ossec/bin/agent_control -lc | grep -E '^[[:space:]]*ID:' | grep -v '(server)' | wc -l" || echo 0)
             echo "client.keys lines: $KEYS, agent_control count: $COUNT"
             if [ "${COUNT:-0}" -ge 1 ] || [ "${KEYS:-0}" -ge 5 ]; then ok=1; break; fi
             sleep 5
           done
           if [ "$ok" -ne 1 ]; then
-            echo "::warning::Enrollment not visible yet; proceeding to auto-flip anyway."
+            echo "::warning::Enrollment not visible yet; continuing."
           fi
 
       - name: Flip agent events to workers & restart DS
@@ -333,20 +355,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          . "$GITHUB_ENV" || true
           if [ -z "${WORKER_POD:-}" ]; then
             WORKER_POD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
             [ -n "$WORKER_POD" ] && echo "WORKER_POD=$WORKER_POD" >> "$GITHUB_ENV"
           fi
           if [ -n "${WORKER_POD:-}" ]; then
-            echo "=== Worker remoted recent ==="
+            echo "=== Worker remoted/authd recent ==="
             kubectl -n "$NS" logs "$WORKER_POD" --tail=300 \
               | egrep -i 'Listening on port 1514|Accepting connections on port 1515|Agent connected|Invalid ID|Authentication file changed' \
               | tail -n 120 || true
-          else
-            echo "::warning::No worker pod found; skipping worker log check."
           fi
-
-          echo "=== agent_control -lc ==="
+          echo "=== agent_control -lc (on master) ==="
           kubectl -n "$NS" exec "$MASTER_POD" -- /var/ossec/bin/agent_control -lc || true
 
       - name: Final diagnostics
@@ -359,7 +379,8 @@ jobs:
           echo "Services:"
           kubectl -n "$NS" get svc wazuh wazuh-workers -o wide || true
           echo
-          echo "Manager ports (expect 1515 authd + 1514 remoted):"
+          echo "Authd/Remoted signals:"
+          . "$GITHUB_ENV" || true
           kubectl -n "$NS" logs "$MASTER_POD" --tail=300 \
             | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" \
             | tail -n 80 || true
@@ -373,6 +394,6 @@ jobs:
           for P in $(kubectl -n "$NS" get pods -l app=wazuh-agent -o name); do
             echo "=== $P ==="
             kubectl -n "$NS" logs "$P" --tail=300 \
-              | egrep -i "Valid key|Reading authentication keys|Trying to connect|Connected to server|keep alive" \
-              | tail -n 60 || true
+              | egrep -i "Valid key|Reading authentication keys|Trying to connect|Connected to server|keep alive|agent-auth" \
+              | tail -n 80 || true
           done
