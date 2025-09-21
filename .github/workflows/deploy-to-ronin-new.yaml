@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       overlay:
-        description: "Overlay to deploy (single or production)"
+        description: "Overlay to deploy: single or production"
         required: true
         default: "single"
       wazuh_tag:
@@ -12,7 +12,7 @@ on:
         required: true
         default: "v4.12.0"
       cleanup_unbound_pvcs:
-        description: "Delete only UNBOUND PVCs before deploy (true/false)"
+        description: "Delete UNBOUND PVCs before deploy (true/false)"
         required: true
         default: "true"
       local_forward_port:
@@ -97,7 +97,7 @@ jobs:
                         mkdir -p /host-etc/sysctl.d
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
                         echo "vm.max_map_count now: $(cat /host-proc/sys/vm/max_map_count)"
-                        sleep 120
+                        sleep 60
                     volumeMounts:
                       - name: host-proc
                         mountPath: /host-proc
@@ -115,32 +115,27 @@ jobs:
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
           kubectl -n kube-system rollout status ds/wazuh-sysctl --timeout=180s || true
-          kubectl -n kube-system get pods -l app=wazuh-sysctl -o wide
-          for p in $(kubectl -n kube-system get pods -l app=wazuh-sysctl -o name); do
-            echo "# $p"
-            kubectl -n kube-system logs "$p" || true
-          done
           kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
       # ---------- END SYSCTL ----------
 
       - name: Ensure dynamic StorageClass alias 'wazuh-storage'
         run: |
-          set -euo pipefail
+          set -e
           if kubectl get sc local-path >/dev/null 2>&1; then
             TARGET_SC="local-path"
           else
-            TARGET_SC=$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.provisioner}{"\n"}{end}' \
-              | awk '$2!="kubernetes.io/no-provisioner"{print $1; exit}')
+            TARGET_SC="$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.provisioner}{"\n"}{end}' | awk '$2!="kubernetes.io/no-provisioner"{print $1; exit}')"
           fi
-          test -n "${TARGET_SC:-}" || { echo "::error::No dynamic StorageClass found"; exit 1; }
-          TARGET_PROV=$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')
-          echo "Using SC '${TARGET_SC}' (${TARGET_PROV}) for wazuh-storage"
+          test -n "$TARGET_SC" || { echo "::error::No dynamic StorageClass found"; exit 1; }
+          TARGET_PROV="$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')"
+
           if kubectl get sc wazuh-storage >/dev/null 2>&1; then
-            CUR_PROV=$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}')
+            CUR_PROV="$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}')"
             if [ "$CUR_PROV" != "$TARGET_PROV" ]; then
               kubectl delete sc wazuh-storage
             fi
           fi
+
           cat <<EOF | kubectl apply -f -
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
@@ -151,85 +146,74 @@ jobs:
           volumeBindingMode: WaitForFirstConsumer
           allowVolumeExpansion: true
           EOF
-          kubectl get sc -o wide
 
       - name: Fetch official wazuh-kubernetes repo
         run: |
-          set -euo pipefail
+          set -e
           rm -rf wazuh-kubernetes
           git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
-          echo "Fetched wazuh-kubernetes@$WAZUH_K8S_TAG"
           ls -la wazuh-kubernetes | sed -n '1,120p'
 
       - name: Resolve overlay path (auto-detect)
         id: resolve
-        shell: bash
         run: |
-          set -euo pipefail
-          want="${OVERLAY_CHOICE}"  # "single" or "production"
-          mapfile -t candidates < <(
-            grep -RIl --include='*.yml' --include='*.yaml' -e 'wazuh-dashboard\|wazuh-manager\|wazuh-indexer' wazuh-kubernetes 2>/dev/null \
-            | xargs -r -n1 dirname | sort -u
-          )
-          if [ ${#candidates[@]} -eq 0 ]; then
+          set -e
+          WANT="${OVERLAY_CHOICE}"
+          CANDIDATES="$(grep -RIl --include='*.yml' --include='*.yaml' -e 'wazuh-dashboard\|wazuh-manager\|wazuh-indexer' wazuh-kubernetes 2>/dev/null | xargs -r -n1 dirname | sort -u)"
+          if [ -z "$CANDIDATES" ]; then
             echo "::error::No Wazuh manifests found in repo tag"
             exit 1
           fi
-          pick=""
-          for d in "${candidates[@]}"; do
-            lc="$(echo "$d" | tr '[:upper:]' '[:lower:]')"
-            if [ "$want" = "single" ] && echo "$lc" | grep -q "single"; then pick="$d"; break; fi
-            if [ "$want" = "production" ] && echo "$lc" | grep -q "prod"; then pick="$d"; break; fi
-          done
-          if [ -z "$pick" ]; then pick="${candidates[0]}"; fi
-          echo "overlay_path=$pick" >> "$GITHUB_OUTPUT"
-          echo "Resolved overlay path: $pick"
-          ls -la "$pick" | sed -n '1,200p'
+          PICK=""
+          while IFS= read -r d; do
+            dl="$(echo "$d" | tr '[:upper:]' '[:lower:]')"
+            if [ "$WANT" = "single" ] && echo "$dl" | grep -q single; then PICK="$d"; break; fi
+            if [ "$WANT" = "production" ] && echo "$dl" | grep -q prod; then PICK="$d"; break; fi
+          done <<< "$CANDIDATES"
+          if [ -z "$PICK" ]; then
+            PICK="$(echo "$CANDIDATES" | head -n1)"
+          fi
+          echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
+          echo "Resolved overlay path: $PICK"
 
       - name: Optional cleanup: delete UNBOUND PVCs only
         run: |
-          set -euo pipefail
+          set -e
           if [ "${CLEANUP_UNBOUND_PVCS}" = "true" ]; then
-            echo "Checking for UNBOUND PVCs in namespace $NS..."
-            UNBOUND=$(kubectl -n "$NS" get pvc --no-headers 2>/dev/null | awk '$2!="Bound"{print $1}')
+            UNBOUND="$(kubectl -n "$NS" get pvc --no-headers 2>/dev/null | awk '$2!="Bound"{print $1}')"
             if [ -n "$UNBOUND" ]; then
-              echo "Deleting unbound PVCs: $UNBOUND"
               for pvc in $UNBOUND; do kubectl -n "$NS" delete pvc "$pvc" --ignore-not-found; done
-            else
-              echo "No unbound PVCs found."
             fi
-          else
-            echo "PVC cleanup disabled."
           fi
 
-      - name: Apply manifests (non-StatefulSets)
-        shell: bash
+      - name: Apply all manifests once (may fail on STS immutability)
         run: |
-          set -euo pipefail
+          set -e
           cd "${{ steps.resolve.outputs.overlay_path }}"
-          files=$(find . -type f \( -name '*.yaml' -o -name '*.yml' \) ! -exec grep -q '^kind:[[:space:]]*StatefulSet' {} \; -print)
-          if [ -n "$files" ]; then
-            echo "$files" | xargs -r -n1 kubectl apply -f
-          else
-            echo "No non-StatefulSet manifests to apply."
-          fi
+          kubectl apply -f .
 
-      - name: Replace StatefulSets (force re-create)
-        shell: bash
+      - name: Recreate StatefulSets cleanly (handle immutability)
         run: |
-          set -euo pipefail
+          set -e
           cd "${{ steps.resolve.outputs.overlay_path }}"
-          sts_files=$(grep -RIl --include='*.yml' --include='*.yaml' '^kind:[[:space:]]*StatefulSet' . || true)
-          if [ -n "$sts_files" ]; then
-            echo "$sts_files" | xargs -r -n1 -I {} sh -c 'echo "Replacing StatefulSet from {}"; kubectl replace --force -f "{}"'
+          STS_NAMES="$(kubectl get -f . -o name 2>/dev/null | grep '^statefulset' || true)"
+          if [ -n "$STS_NAMES" ]; then
+            echo "Deleting StatefulSets to avoid immutable-field conflicts..."
+            # Namespace is embedded in files; delete by name in target namespace
+            for n in $STS_NAMES; do
+              # n looks like statefulset.apps/<name>
+              NAME="$(echo "$n" | cut -d'/' -f2)"
+              kubectl -n "$NS" delete statefulset "$NAME" --ignore-not-found=true
+            done
+            echo "Re-applying manifests..."
+            kubectl apply -f .
           else
-            echo "No StatefulSets found."
+            echo "No StatefulSets detected in overlay."
           fi
 
       - name: Wait for core components
         run: |
-          set -euxo pipefail
-          kubectl -n "$NS" get pods -o wide || true
+          set -e
           kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-manager  --timeout=1200s || true
           kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-indexer  --timeout=1200s || true
           kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-dashboard --timeout=1200s || true
@@ -237,7 +221,7 @@ jobs:
 
       - name: Expose Dashboard via fixed NodePort (svc/wazuh-dashboard-nodeport)
         run: |
-          set -euo pipefail
+          set -e
           DASH_SVC="wazuh-dashboard-nodeport"
           NODEPORT=30443
           cat <<EOF | kubectl apply -f -
@@ -257,7 +241,7 @@ jobs:
               protocol: TCP
               nodePort: ${NODEPORT}
           EOF
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' | head -n1)
+          NODE_IP="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' | head -n1)"
           echo "WAZUH_NODEPORT_URL=https://${NODE_IP}:${NODEPORT}"
 
       - name: Print port-forward one-liner (optional)
