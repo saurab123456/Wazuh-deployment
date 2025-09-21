@@ -92,7 +92,7 @@ jobs:
                 /<auth>/ && !ins { print "    <use_password>no</use_password>"; ins=1 }'"'"' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
               fi
             '
-            echo "Deleting $POD to apply config…"
+            echo "Deleting $POD to apply config (StatefulSet will recreate)…"
             kubectl -n "$NS" delete pod "$POD"
           }
 
@@ -123,8 +123,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Unquoted heredoc so ${IMAGE} etc expand on the runner.
-          # All variables meant for the CONTAINER are escaped as \${…}.
+          # IMPORTANT:
+          # - Unescaped ${IMAGE} is expanded by the runner (intended).
+          # - All $ meant for the CONTAINER are escaped as \$ or \${...}.
           cat <<EOF | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
@@ -219,7 +220,7 @@ jobs:
                       - |
                         set -e
                         AGENT_NAME="\${NODE_NAME}"
-                        echo "Agent name: \${AGENT_NAME}"
+                        echo "Agent name: \$AGENT_NAME"
 
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
