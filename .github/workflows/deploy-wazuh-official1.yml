@@ -15,6 +15,10 @@ on:
         description: "Delete UNBOUND PVCs before deploy (true/false)"
         required: true
         default: "true"
+      wipe_indexer_pvcs:
+        description: "DANGER: delete ALL indexer PVCs if crashloop persists (true/false)"
+        required: true
+        default: "false"
       local_forward_port:
         description: "Local port for port-forward"
         required: true
@@ -40,6 +44,7 @@ jobs:
       WAZUH_K8S_TAG: ${{ inputs.wazuh_tag }}
       OVERLAY_CHOICE: ${{ inputs.overlay }}
       CLEANUP_UNBOUND_PVCS: ${{ inputs.cleanup_unbound_pvcs }}
+      WIPE_INDEXER_PVCS: ${{ inputs.wipe_indexer_pvcs }}
       LOCAL_FORWARD_PORT: ${{ inputs.local_forward_port }}
 
     steps:
@@ -83,8 +88,8 @@ jobs:
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # ---------- SYSCTL ----------
-      - name: Set vm.max_map_count on nodes (DaemonSet)
+      # ---------- SYSCTL: set and KEEP it running (and verifiable) ----------
+      - name: Ensure vm.max_map_count on all nodes (DaemonSet kept)
         shell: bash
         run: |
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
@@ -109,8 +114,9 @@ jobs:
                         echo 262144 > /host-proc/sys/vm/max_map_count
                         mkdir -p /host-etc/sysctl.d
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
-                        echo "now: $(cat /host-proc/sys/vm/max_map_count)"
-                        sleep 30
+                        echo "node: $(hostname) vm.max_map_count=$(cat /host-proc/sys/vm/max_map_count)"
+                        # stay up so the value remains verifiable in this run
+                        sleep 3600
                     volumeMounts:
                       - { name: host-proc, mountPath: /host-proc }
                       - { name: host-etc,  mountPath: /host-etc  }
@@ -119,9 +125,12 @@ jobs:
                   - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
-          kubectl -n kube-system rollout status ds/wazuh-sysctl --timeout=180s || true
-          kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
-      # ---------- END SYSCTL ----------
+          # give it a moment to schedule and set the value, then show logs
+          sleep 5
+          kubectl -n kube-system get pods -l app=wazuh-sysctl -o wide || true
+          for p in $(kubectl -n kube-system get pods -l app=wazuh-sysctl -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+            kubectl -n kube-system logs "$p" || true
+          done
 
       - name: Ensure StorageClass alias 'wazuh-storage'
         shell: bash
@@ -248,6 +257,17 @@ jobs:
             fi
           fi
 
+      # ---------- Optional HARD reset of indexer data ----------
+      - name: OPTIONAL: wipe ALL indexer PVCs (if set)
+        if: ${{ inputs.wipe_indexer_pvcs == 'true' }}
+        shell: bash
+        run: |
+          set -e
+          echo "::warning::Deleting ALL indexer PVCs (data loss for indexer)."
+          for pvc in $(kubectl -n "$NS" get pvc -o name | grep -E 'data-wazuh-indexer-[0-9]+$' || true); do
+            kubectl -n "$NS" delete "$pvc" --ignore-not-found=true
+          done
+
       - name: Apply non-StatefulSet resources (filter out StorageClass)
         shell: bash
         run: |
@@ -276,14 +296,12 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # ===== Patch the EXACT ConfigMaps used by running manager pods =====
+      # ===== Patch the EXACT ConfigMaps used by running manager pods (passwordless) =====
       - name: Patch manager ossec.conf in live ConfigMaps (passwordless)
         shell: bash
         run: |
           set -euo pipefail
           NS="${NS:-wazuh}"
-
-          # Collect CM names from BOTH Pods and StatefulSets, then uniq
           CM_NAMES="$(
             { kubectl -n "$NS" get pods -l app=wazuh-manager \
                 -o jsonpath='{range .items[*].spec.volumes[*]}{.configMap.name}{"\n"}{end}';
@@ -291,37 +309,22 @@ jobs:
                 -o jsonpath='{range .items[*].spec.template.spec.volumes[*]}{.configMap.name}{"\n"}{end}';
             } 2>/dev/null | sort -u | sed '/^$/d' || true
           )"
-
-          if [ -z "$CM_NAMES" ]; then
-            echo "::error::No ConfigMaps referenced by wazuh-manager pods/STS were found."
-            exit 1
-          fi
-
+          test -n "$CM_NAMES" || { echo "::warning::No manager ConfigMaps found"; exit 0; }
           for CM in $CM_NAMES; do
             echo ">> Processing ConfigMap: $CM"
             kubectl -n "$NS" get cm "$CM" -o yaml > "/tmp/${CM}.yaml"
-
             yq -r '.data."ossec.conf"' "/tmp/${CM}.yaml" > /tmp/ossec.conf.cm || true
             if [ ! -s /tmp/ossec.conf.cm ] || grep -qx 'null' /tmp/ossec.conf.cm; then
               echo "::warning::${CM} has no data.ossec.conf; skipping"
               continue
             fi
-
-            # Update within <auth>…</auth>
             sed -i -E '/<auth>/,/<\/auth>/ s|<use_password>[^<]+</use_password>|<use_password>no</use_password>|' /tmp/ossec.conf.cm
             sed -i -E '/<auth>/,/<\/auth>/ s|<port>[0-9]+</port>|<port>1515</port>|' /tmp/ossec.conf.cm
             awk 'BEGIN{inauth=0} /<auth>/{inauth=1} inauth && /<password>.*<\/password>/{next} /<\/auth>/{inauth=0} {print}' /tmp/ossec.conf.cm > /tmp/ossec.conf.cm.new && mv /tmp/ossec.conf.cm.new /tmp/ossec.conf.cm
-
-            # Put it back and apply
             yq -i '.data."ossec.conf" = load_str("/tmp/ossec.conf.cm")' "/tmp/${CM}.yaml"
             kubectl -n "$NS" apply -f "/tmp/${CM}.yaml"
-
-            # Show resulting block (no fail on print)
-            awk 'BEGIN{inauth=0} /<auth>/{inauth=1} inauth{print} /<\/auth>/{inauth=0}' /tmp/ossec.conf.cm || true
-            echo
           done
 
-      # ===== Immediate in-pod patch & purge authd.pass =====
       - name: Force passwordless on ALL managers (in-pod sed + purge authd.pass)
         shell: bash
         run: |
@@ -540,6 +543,21 @@ jobs:
           fi
           test -n "${PORT:-}" || { echo "::error::Could not determine dashboard port"; exit 1; }
           echo "dash_port=${PORT}" >> "$GITHUB_OUTPUT"
+
+      # ---------- Auto collect indexer logs if any container crashes ----------
+      - name: Indexer quick logs (if crashloop)
+        shell: bash
+        run: |
+          set -e
+          pods=$(kubectl -n "$NS" get pods -l app=wazuh-indexer -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.containerStatuses[0].state.waiting.reason}{"\n"}{end}' || true)
+          echo "$pods" | grep -qi crash && {
+            for p in $(echo "$pods" | awk '$2 ~ /CrashLoopBackOff/ {print $1}'); do
+              echo "==== Logs: $p ===="
+              kubectl -n "$NS" logs "$p" --tail=200 || true
+              echo "==== Describe: $p ===="
+              kubectl -n "$NS" describe pod "$p" | tail -n +1 || true
+            done
+          } || echo "Indexer pods are not crashing."
 
       - name: Start Dashboard port-forward (auto)
         if: ${{ inputs.enable_port_forward == 'true' }}
