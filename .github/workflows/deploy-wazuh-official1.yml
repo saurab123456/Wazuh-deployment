@@ -144,7 +144,6 @@ jobs:
           set -e
           rm -rf wazuh-kubernetes
           git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
-          ls -la wazuh-kubernetes | sed -n '1,120p'
 
       - name: Resolve overlay path (auto-detect)
         id: resolve
@@ -210,17 +209,15 @@ jobs:
         run: |
           set -e
           kubectl kustomize "${{ steps.resolve.outputs.overlay_path }}" > /tmp/wazuh-all.yaml
-          echo "Built: /tmp/wazuh-all.yaml"
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
-      # Strip any password secret mounts/env to avoid conflicts
+      # Strip any password mounts/env (we're passwordless)
       - name: Remove auth password Secret mounts (passwordless)
         shell: bash
         run: |
           set -euo pipefail
           IN=/tmp/wazuh-all.yaml
           OUT=/tmp/wazuh-all-passwordless.yaml
-
           yq eval -o=y '
             (.. | select(tag=="!!map" and has("kind") and .kind=="StatefulSet"))
             |= (
@@ -234,7 +231,6 @@ jobs:
             )
           ' "$IN" > "$OUT"
           mv "$OUT" /tmp/wazuh-all.yaml
-          echo "Password Secret mounts stripped."
 
       - name: Optional cleanup (delete UNBOUND PVCs only)
         shell: bash
@@ -271,11 +267,11 @@ jobs:
           set -e
           for sel in "app=wazuh-indexer" "app=wazuh-manager" "app=wazuh-dashboard"; do
             echo "Waiting for: $sel"
-            kubectl -n "$NS" wait --for=condition=Ready pod -l "$sel" --timeout=1800s || true
+            kubectl -n "$NS" wait --for=condition=Ready pod -l "$sel" --timeout=1200s || true
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # === Managers: enable AUTHD (passwordless) ===
+      # === Managers: enable AUTHD (passwordless) + safe restart + verify 1515 ===
       - name: Enable authd (passwordless) on ALL managers
         env:
           MANAGER_SELECTOR: app=wazuh-manager
@@ -291,23 +287,40 @@ jobs:
               CONF=/var/ossec/etc/ossec.conf
               cp -f "$CONF" "${CONF}.bak.$(date +%s)" || true
 
-              # Ensure <auth> exists and is passwordless on 1515
+              # Ensure <auth> exists and is passwordless on 1515; strip any <password>...</password>
               if grep -q "<auth>" "$CONF"; then
                 sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
-                # Remove any <password>...</password> inside <auth>
                 awk '"'"'BEGIN{in_auth=0} /<auth>/{in_auth=1} in_auth && /<password>.*<\/password>/{next} /<\/auth>/{in_auth=0} {print}'"'"' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
               else
                 awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>no</use_password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
 
-              # Ensure <remote> block exists for agent events (1514/tcp)
+              # Ensure <remote> exists for 1514/tcp events
               if grep -q "<remote>" "$CONF"; then
                 sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
               else
                 awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
 
-              /var/ossec/bin/wazuh-control restart
+              echo "Restarting Wazuh manager (safe)…"
+              for i in 1 2 3 4; do
+                if /var/ossec/bin/wazuh-control restart; then break; fi
+                echo "restart failed (attempt $i) — clearing lock and retrying"
+                rm -f /var/ossec/var/start-script-lock || true
+                sleep 3
+              done
+
+              # Final attempt to ensure it is up
+              /var/ossec/bin/wazuh-control start || true
+
+              echo "Verify authd is listening on 1515…"
+              for i in $(seq 1 30); do
+                if ss -Hntl | awk '"'"'$4 ~ /:1515$/{print; found=1} END{exit found?0:1}'"'"'; then
+                  echo "authd is listening on 1515"; break
+                fi
+                sleep 2
+              done
+              ss -Hntl | grep -E ":1515$" || { echo "authd not listening on 1515"; tail -n 100 /var/ossec/logs/ossec.log || true; exit 1; }
             '
           done
 
@@ -315,12 +328,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Remove the broad 'wazuh' Service if it exists to avoid 1515 hitting workers
           kubectl -n "$NS" delete svc wazuh --ignore-not-found=true
-
           cat <<'EOF' | kubectl -n "$NS" apply -f -
           ---
-          # Authd on the MASTER only (1515)
           apiVersion: v1
           kind: Service
           metadata:
@@ -332,7 +342,6 @@ jobs:
             ports:
               - { name: authd, port: 1515, targetPort: 1515, protocol: TCP }
           ---
-          # Agents' event channel (1514). Select workers; include master if you prefer.
           apiVersion: v1
           kind: Service
           metadata:
@@ -344,12 +353,8 @@ jobs:
             ports:
               - { name: agents-events, port: 1514, targetPort: 1514, protocol: TCP }
           EOF
-
-          echo "----- Services -----"
           kubectl -n "$NS" get svc -o wide
-          echo "----- Endpoints -----"
-          kubectl -n "$NS" get endpoints wazuh-authd-master -o wide || true
-          kubectl -n "$NS" get endpoints wazuh-workers -o wide || true
+          kubectl -n "$NS" get endpoints -o wide
 
       # === Agent side (passwordless enrollment to master-only service) ===
       - name: Create Agent ConfigMap (passwordless enrollment)
@@ -504,7 +509,6 @@ jobs:
           fi
           test -n "${PORT:-}" || { echo "::error::Could not determine dashboard port"; exit 1; }
           echo "dash_port=${PORT}" >> "$GITHUB_OUTPUT"
-          echo "Discovered dashboard port: ${PORT}"
 
       - name: Start Dashboard port-forward (auto)
         if: ${{ inputs.enable_port_forward == 'true' }}
@@ -516,7 +520,6 @@ jobs:
           set -euo pipefail
           TARGET_PORT="${{ steps.dash.outputs.dash_port }}"
           (pkill -f "port-forward .*:${PF_PORT}:" && sleep 1) || true
-          echo "Starting PF: localhost:${PF_PORT} -> deploy/wazuh-dashboard:${TARGET_PORT}"
           nohup kubectl -n "${NS}" port-forward --address "${PF_BIND}" deploy/wazuh-dashboard "${PF_PORT}:${TARGET_PORT}" > portforward.log 2>&1 &
           echo "::notice title=Browse Now::Open http://localhost:${PF_PORT}"
 
