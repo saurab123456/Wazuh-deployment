@@ -225,6 +225,35 @@ jobs:
           kubectl kustomize "${{ steps.resolve.outputs.overlay_path }}" > /tmp/wazuh-all.yaml
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
+      # NEW: Make passwordless the template (before apply)
+      - name: Enforce passwordless <auth> in manager ConfigMaps (pre-apply)
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT=/tmp/wazuh-all.yaml
+          # For every ConfigMap that has data.ossec.conf, rewrite the <auth> block:
+          # - use_password=no
+          # - port=1515
+          # - remove inline <password>...</password>
+          yq -i '
+            (select(.kind=="ConfigMap" and .data."ossec.conf")
+             | .data."ossec.conf") as $oc
+            | .data."ossec.conf" =
+                (($oc
+                  | sub("(?s)(<auth>)(.*?)(</auth>)";
+                        . as $all
+                        | capture("(?s)(?<open><auth>)(?<body>.*?)(?<close></auth>)") as $m
+                        | ($m.body
+                            | sub("<use_password>[^<]+</use_password>"; "<use_password>no</use_password>")
+                            | sub("<port>[^<]+</port>"; "<port>1515</port>")
+                            | sub("(?s)[[:space:]]*<password>[^<]*</password>[[:space:]]*"; "")
+                          ) as $nb
+                        | "\($m.open)\($nb)\($m.close)"
+                       )
+                 )
+                )
+          ' "$OUT"
+
       - name: Remove auth password Secret mounts (passwordless)
         shell: bash
         run: |
@@ -283,6 +312,41 @@ jobs:
             yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-sts.yaml
             kubectl -n "$NS" apply -f /tmp/wazuh-sts.yaml
           fi
+
+      # NEW: add a best-effort init guard so pods enforce passwordless on boot
+      - name: Add initContainer guard to managers (force passwordless on boot)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for sts in wazuh-manager-master wazuh-manager-worker; do
+            kubectl -n "$NS" get sts "$sts" >/dev/null 2>&1 || continue
+            kubectl -n "$NS" patch statefulset "$sts" --type='merge' -p '
+            spec:
+              template:
+                spec:
+                  initContainers:
+                  - name: force-passwordless-authd
+                    image: busybox:1.36
+                    securityContext:
+                      runAsUser: 0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        f=/var/ossec/etc/ossec.conf
+                        [ -f "$f" ] || { echo "no ossec.conf yet"; exit 0; }
+                        awk '"'"'
+                          BEGIN{in=0}
+                          /<auth>/{in=1}
+                          in && /<password>.*<\/password>/{next}
+                          /<\/auth>/{in=0}
+                          {print}
+                        '"'"' "$f" > "$f.tmp" && mv "$f.tmp" "$f" || true
+                        sed -i -E "/<auth>/,/<\\/auth>/ s|<use_password>[^<]+</use_password>|<use_password>no</use_password>|" "$f" || true
+                        sed -i -E "/<auth>/,/<\\/auth>/ s|<port>[^<]+</port>|<port>1515</port>|" "$f" || true
+                        rm -f /var/ossec/etc/authd.pass || true
+            ' || true
+          done
 
       - name: Wait & diagnose core components
         shell: bash
