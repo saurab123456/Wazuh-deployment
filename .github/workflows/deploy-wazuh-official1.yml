@@ -90,10 +90,7 @@ jobs:
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
           apiVersion: apps/v1
           kind: DaemonSet
-          metadata:
-            name: wazuh-sysctl
-            namespace: kube-system
-            labels: { app: wazuh-sysctl }
+          metadata: { name: wazuh-sysctl, namespace: kube-system, labels: { app: wazuh-sysctl } }
           spec:
             selector: { matchLabels: { app: wazuh-sysctl } }
             template:
@@ -133,8 +130,7 @@ jobs:
           if kubectl get sc local-path >/dev/null 2>&1; then
             TARGET_SC="local-path"
           else
-            TARGET_SC="$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.provisioner}{"\n"}{end}' \
-              | awk '$2!="kubernetes.io/no-provisioner"{print $1; exit}')"
+            TARGET_SC="$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.provisioner}{"\n"}{end}' | awk '$2!="kubernetes.io/no-provisioner"{print $1; exit}')"
           fi
           test -n "$TARGET_SC" || { echo "::error::No dynamic StorageClass found"; exit 1; }
           TARGET_PROV="$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')"
@@ -201,10 +197,13 @@ jobs:
           CONF
           openssl genrsa -out "$IC/root-ca-key.pem" 4096
           openssl req -x509 -new -key "$IC/root-ca-key.pem" -sha256 -days 3650 -out "$IC/root-ca.pem" -subj "/CN=Wazuh Root CA"
-          sign_ic() { local name="$1"; openssl genrsa -out "$IC/${name}-key.pem" 2048
+          sign_ic() {
+            local name="$1"
+            openssl genrsa -out "$IC/${name}-key.pem" 2048
             openssl req -new -key "$IC/${name}-key.pem" -out "$IC/${name}.csr" -config /tmp/wazuh-openssl.cnf
             openssl x509 -req -in "$IC/${name}.csr" -CA "$IC/root-ca.pem" -CAkey "$IC/root-ca-key.pem" -CAcreateserial -out "$IC/${name}.pem" -days 825 -sha256 -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
-            rm -f "$IC/${name}.csr"; }
+            rm -f "$IC/${name}.csr"
+          }
           for n in admin dashboard node filebeat; do sign_ic "$n"; done
           openssl genrsa -out "$DH/key.pem" 2048
           openssl req -new -key "$DH/key.pem" -out "$DH/dashboard.csr" -config /tmp/wazuh-openssl.cnf
@@ -277,45 +276,44 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # ===== Managers: enable AUTHD passwordless (NO in-pod restart) =====
-      - name: Enable authd (passwordless) on ALL managers (no in-pod restart)
+      # ===== Managers: force passwordless (patch you requested) =====
+      - name: Force passwordless on ALL managers (sed patch + purge authd.pass)
         shell: bash
-        env:
-          MANAGER_SELECTOR: app=wazuh-manager
         run: |
           set -euo pipefail
-          PODS=$(kubectl -n "$NS" get pods -l "$MANAGER_SELECTOR" -o name)
-          test -n "$PODS" || { echo "No manager pods found"; exit 1; }
-          for POD in $PODS; do
-            echo ">> Patching $POD"
-            kubectl -n "$NS" exec "$POD" -c wazuh-manager -- sh -lc '
+          export NS="${NS:-wazuh}"
+          for P in $(kubectl -n "$NS" get pods -l app=wazuh-manager -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+            echo "Patching $P ..."
+            kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc '
               set -e
-              CONF=/var/ossec/etc/ossec.conf
-              cp -f "$CONF" "${CONF}.bak.$(date +%s)" || true
-              if grep -q "<auth>" "$CONF"; then
-                sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
-                awk '"'"'BEGIN{in_auth=0} /<auth>/{in_auth=1} in_auth && /<password>.*<\/password>/{next} /<\/auth>/{in_auth=0} {print}'"'"' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
-              else
-                awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>no</use_password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
-              fi
-              if grep -q "<remote>" "$CONF"; then
-                sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
-              else
-                awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
-              fi
+              f=/var/ossec/etc/ossec.conf
+              cp "$f" "${f}.bak.$(date +%s)" || true
+              # Force port 1515 and passwordless inside <auth>…</auth>
+              sed -i -E "/<auth>/,/<\/auth>/ s|<port>[0-9]+</port>|<port>1515</port>|" "$f"
+              sed -i -E "/<auth>/,/<\/auth>/ s|<use_password>[^<]+</use_password>|<use_password>no</use_password>|" "$f"
+              # Remove any <password>…</password> line and purge authd.pass if present
+              awk '"'"'BEGIN{in=0} /<auth>/{in=1} in && /<password>.*<\/password>/{next} /<\/auth>/{in=0} {print}'"'"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              rm -f /var/ossec/etc/authd.pass || true
+              # Show resulting <auth> block
+              echo "----- <auth> after patch (pod $(hostname)) -----"
+              sed -n "/<auth>/,/<\\/auth>/p" "$f"
             '
           done
 
-      - name: Rollout restart manager StatefulSets (safe) and wait
+      - name: Rollout restart manager StatefulSets (apply passwordless)
         shell: bash
         run: |
           set -e
           for s in wazuh-manager-master wazuh-manager-worker; do
             kubectl -n "$NS" get sts "$s" >/dev/null 2>&1 || continue
             kubectl -n "$NS" rollout restart sts/"$s"
-            kubectl -n "$NS" rollout status sts/"$s" --timeout=600s
+            kubectl -n "$NS" rollout status  sts/"$s" --timeout=600s
           done
-          kubectl -n "$NS" get pods -l app=wazuh-manager -o wide
+          echo "Verify auth blocks:"
+          for P in $(kubectl -n "$NS" get pods -l app=wazuh-manager -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+            echo "=== $P ==="
+            kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc 'sed -n "/<auth>/,/<\\/auth>/p" /var/ossec/etc/ossec.conf'
+          done
 
       - name: Ensure Services (master-only 1515 + workers 1514)
         shell: bash
@@ -346,6 +344,7 @@ jobs:
             ports:
               - { name: agents-events, port: 1514, targetPort: 1514, protocol: TCP }
           EOF
+          echo "Services and endpoints:"
           kubectl -n "$NS" get svc -o wide
           kubectl -n "$NS" get endpoints -o wide
 
@@ -372,9 +371,7 @@ jobs:
             </client>
           </ossec_config>
           EOF
-          kubectl -n "$NS" create configmap wazuh-agent-ossec \
-            --from-file=ossec.conf=/tmp/agent-ossec.conf \
-            -o yaml --dry-run=client | kubectl apply -f -
+          kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
 
       - name: Deploy Agent DaemonSet (agent-auth without -P)
         shell: bash
@@ -466,10 +463,10 @@ jobs:
                       requests: { cpu: "100m", memory: "256Mi" }
                       limits:   { cpu: "1000m", memory: "1024Mi" }
                     volumeMounts:
-                      - { name: ossec-conf-cm,   mountPath: /config,                  readOnly: true }
-                      - { name: varlogcontainers, mountPath: /host/var/log/containers, readOnly: true }
-                      - { name: varlogpods,       mountPath: /host/var/log/pods,       readOnly: true }
-                      - { name: varlog,           mountPath: /host/var/log,            readOnly: true }
+                      - { name: ossec-conf-cm,   mountPath: /config,                    readOnly: true }
+                      - { name: varlogcontainers, mountPath: /host/var/log/containers,   readOnly: true }
+                      - { name: varlogpods,       mountPath: /host/var/log/pods,         readOnly: true }
+                      - { name: varlog,           mountPath: /host/var/log,              readOnly: true }
                 volumes:
                   - { name: ossec-conf-cm,   configMap: { name: wazuh-agent-ossec } }
                   - { name: varlogcontainers, hostPath: { path: /var/log/containers, type: DirectoryOrCreate } }
