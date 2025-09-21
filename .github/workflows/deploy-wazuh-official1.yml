@@ -176,13 +176,15 @@ jobs:
           echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
           echo "Resolved: $PICK"
 
-      # NEW: generate self-signed TLS certs expected by Kustomize
-      - name: Generate self-signed indexer certs (for Kustomize)
+      # ---------- CERTS FOR KUSTOMIZE ----------
+      - name: Generate self-signed certs for Kustomize (indexer + dashboard_http)
         run: |
           set -e
-          CERTDIR="${{ github.workspace }}/wazuh-kubernetes/wazuh/certs/indexer_cluster"
-          mkdir -p "$CERTDIR"
-          # OpenSSL config for SANs
+          CERTROOT="${{ github.workspace }}/wazuh-kubernetes/wazuh/certs"
+          IC="${CERTROOT}/indexer_cluster"
+          DH="${CERTROOT}/dashboard_http"
+          mkdir -p "$IC" "$DH"
+
           cat > /tmp/wazuh-openssl.cnf <<'CONF'
           [req]
           default_bits=2048
@@ -191,7 +193,7 @@ jobs:
           req_extensions = v3_req
           distinguished_name=req_dn
           [req_dn]
-          CN=placeholder
+          CN=wazuh-local
           [v3_req]
           basicConstraints = CA:FALSE
           keyUsage = digitalSignature, keyEncipherment
@@ -200,23 +202,33 @@ jobs:
           [alt_names]
           DNS.1 = wazuh-indexer
           DNS.2 = wazuh-indexer.wazuh.svc
-          DNS.3 = wazuh-indexer-0
-          DNS.4 = localhost
+          DNS.3 = wazuh-dashboard
+          DNS.4 = wazuh-dashboard.wazuh.svc
+          DNS.5 = localhost
           IP.1  = 127.0.0.1
           CONF
-          # Root CA
-          openssl genrsa -out "$CERTDIR/root-ca-key.pem" 4096
-          openssl req -x509 -new -key "$CERTDIR/root-ca-key.pem" -sha256 -days 3650 -subj "/CN=Wazuh Root CA" -out "$CERTDIR/root-ca.pem"
-          sign() {
+
+          # Root CA for indexer cluster
+          openssl genrsa -out "$IC/root-ca-key.pem" 4096
+          openssl req -x509 -new -key "$IC/root-ca-key.pem" -sha256 -days 3650 -subj "/CN=Wazuh Root CA" -out "$IC/root-ca.pem"
+
+          sign_ic() {
             local name="$1"
-            openssl genrsa -out "$CERTDIR/${name}-key.pem" 2048
-            openssl req -new -key "$CERTDIR/${name}-key.pem" -out "$CERTDIR/${name}.csr" -config /tmp/wazuh-openssl.cnf
-            openssl x509 -req -in "$CERTDIR/${name}.csr" -CA "$CERTDIR/root-ca.pem" -CAkey "$CERTDIR/root-ca-key.pem" -CAcreateserial -out "$CERTDIR/${name}.pem" -days 825 -sha256 -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
-            rm -f "$CERTDIR/${name}.csr"
+            openssl genrsa -out "$IC/${name}-key.pem" 2048
+            openssl req -new -key "$IC/${name}-key.pem" -out "$IC/${name}.csr" -config /tmp/wazuh-openssl.cnf
+            openssl x509 -req -in "$IC/${name}.csr" -CA "$IC/root-ca.pem" -CAkey "$IC/root-ca-key.pem" -CAcreateserial -out "$IC/${name}.pem" -days 825 -sha256 -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
+            rm -f "$IC/${name}.csr"
           }
-          for n in admin dashboard node filebeat; do sign "$n"; done
-          # List generated files
-          ls -l "$CERTDIR"
+          for n in admin dashboard node filebeat; do sign_ic "$n"; done
+
+          # Dashboard HTTPS cert pair
+          openssl genrsa -out "$DH/key.pem" 2048
+          openssl req -new -key "$DH/key.pem" -out "$DH/dashboard.csr" -config /tmp/wazuh-openssl.cnf
+          openssl x509 -req -in "$DH/dashboard.csr" -CA "$IC/root-ca.pem" -CAkey "$IC/root-ca-key.pem" -CAcreateserial -out "$DH/cert.pem" -days 825 -sha256 -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
+          rm -f "$DH/dashboard.csr"
+
+          ls -la "$IC" "$DH"
+      # ---------- END CERTS ----------
 
       - name: Build overlay with Kustomize
         run: |
@@ -224,7 +236,6 @@ jobs:
           OVER="${{ steps.resolve.outputs.overlay_path }}"
           kubectl kustomize "$OVER" > /tmp/wazuh-all.yaml
           echo "Built: /tmp/wazuh-all.yaml"
-          # Clean prior bad dashboard state, if any
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
       - name: Optional cleanup (delete UNBOUND PVCs only)
