@@ -105,7 +105,7 @@ jobs:
                         mkdir -p /host-etc/sysctl.d
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
                         echo "now: $(cat /host-proc/sys/vm/max_map_count)"
-                        sleep 60
+                        sleep 30
                     volumeMounts:
                       - { name: host-proc, mountPath: /host-proc }
                       - { name: host-etc,  mountPath: /host-etc  }
@@ -114,7 +114,6 @@ jobs:
                   - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
-          kubectl -n kube-system rollout status ds/wazuh-sysctl --timeout=180s || true
           kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
       # ---------- END SYSCTL ----------
 
@@ -129,10 +128,6 @@ jobs:
           fi
           test -n "$TARGET_SC" || { echo "::error::No dynamic StorageClass found"; exit 1; }
           TARGET_PROV="$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')"
-          if kubectl get sc wazuh-storage >/dev/null 2>&1; then
-            CUR_PROV="$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}')"
-            if [ "$CUR_PROV" != "$TARGET_PROV" ]; then kubectl delete sc wazuh-storage; fi
-          fi
           cat <<EOF | kubectl apply -f -
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
@@ -157,7 +152,6 @@ jobs:
         run: |
           set -euo pipefail
           ROOT="wazuh-kubernetes/wazuh"
-          echo "Tree under $ROOT:"; ls -la "$ROOT" | sed -n '1,200p' || true
           if [ -f "$ROOT/kustomization.yml" ] || [ -f "$ROOT/kustomization.yaml" ]; then
             PICK="$ROOT"
           else
@@ -165,7 +159,6 @@ jobs:
           fi
           test -n "${PICK:-}" || { echo "::error::Could not find any kustomize overlays under $ROOT"; exit 1; }
           echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
-          echo "Resolved overlay_path=$PICK"
 
       - name: Generate self-signed certs for Kustomize (indexer + dashboard_http)
         shell: bash
@@ -216,13 +209,11 @@ jobs:
         shell: bash
         run: |
           set -e
-          OVER="${{ steps.resolve.outputs.overlay_path }}"
-          kubectl kustomize "$OVER" > /tmp/wazuh-all.yaml
+          kubectl kustomize "${{ steps.resolve.outputs.overlay_path }}" > /tmp/wazuh-all.yaml
           echo "Built: /tmp/wazuh-all.yaml"
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
-      # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-      # KEY FIX: strip any password Secret mounts so manager pods can start
+      # Strip any password secret mounts/env to avoid conflicts
       - name: Remove auth password Secret mounts (passwordless)
         shell: bash
         run: |
@@ -230,38 +221,20 @@ jobs:
           IN=/tmp/wazuh-all.yaml
           OUT=/tmp/wazuh-all-passwordless.yaml
 
-          # Remove volumes that carry auth/enroll passwords
           yq eval -o=y '
-            ( . as $doc
-              | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
-              | .spec.template.spec.volumes
-            ) |= ( . // [] | map(select(.name != "wazuh-authd-pass" and .name != "wazuh-enroll-pass")) )
-          ' "$IN" > "$OUT.tmp1"
-
-          # Remove volumeMounts referencing those volumes in all containers
-          yq eval -o=y '
-            ( . as $doc
-              | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
-              | .spec.template.spec.containers
-            ) |= ( . // [] | map(
-                  .volumeMounts = ( .volumeMounts // [] | map(select(.name != "wazuh-authd-pass" and .name != "wazuh-enroll-pass")) )
-                ))
-          ' "$OUT.tmp1" > "$OUT.tmp2"
-
-          # Best-effort: remove env vars that try to pass a password
-          yq eval -o=y '
-            ( . as $doc
-              | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
-              | .spec.template.spec.containers
-            ) |= ( . // [] | map(
-                  .env = ( .env // [] | map(select(.name != "WAZUH_MANAGER_PASSWORD" and .name != "WAZUH_AUTHD_PASSWORD")) )
-                ))
-          ' "$OUT.tmp2" > "$OUT"
-
+            (.. | select(tag=="!!map" and has("kind") and .kind=="StatefulSet"))
+            |= (
+              .spec.template.spec.volumes
+                = (.spec.template.spec.volumes // [] | map(select(.name!="wazuh-authd-pass" and .name!="wazuh-enroll-pass"))) |
+              .spec.template.spec.containers
+                = (.spec.template.spec.containers // [] | map(
+                    .volumeMounts = (.volumeMounts // [] | map(select(.name!="wazuh-authd-pass" and .name!="wazuh-enroll-pass"))) |
+                    .env = (.env // [] | map(select(.name!="WAZUH_MANAGER_PASSWORD" and .name!="WAZUH_AUTHD_PASSWORD")))
+                  ))
+            )
+          ' "$IN" > "$OUT"
           mv "$OUT" /tmp/wazuh-all.yaml
-          rm -f "$OUT.tmp1" "$OUT.tmp2" || true
-          echo "Password Secret mounts stripped. Proceeding passwordless."
-      # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+          echo "Password Secret mounts stripped."
 
       - name: Optional cleanup (delete UNBOUND PVCs only)
         shell: bash
@@ -278,17 +251,17 @@ jobs:
         shell: bash
         run: |
           set -e
-          yq eval -o=y 'select(.kind != "StorageClass" and .kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sts-sc.yaml
+          yq -o=y e 'select(.kind != "StorageClass" and .kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sts-sc.yaml
           if [ -s /tmp/wazuh-no-sts-sc.yaml ]; then kubectl -n "$NS" apply -f /tmp/wazuh-no-sts-sc.yaml; fi
 
       - name: Recreate StatefulSets to avoid immutability errors
         shell: bash
         run: |
           set -e
-          NAMES="$(yq eval -r 'select(.kind == "StatefulSet" and .metadata.name != null) | .metadata.name' /tmp/wazuh-all.yaml | sed 's/\r$//' | grep -E '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || true)"
+          NAMES="$(yq -r 'select(.kind == "StatefulSet" and .metadata.name != null) | .metadata.name' /tmp/wazuh-all.yaml | sed 's/\r$//' | grep -E '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || true)"
           if [ -n "$NAMES" ]; then
             for n in $NAMES; do kubectl -n "$NS" delete statefulset "$n" --ignore-not-found=true; done
-            yq eval -o=y 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-sts.yaml
+            yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-sts.yaml
             kubectl -n "$NS" apply -f /tmp/wazuh-sts.yaml
           fi
 
@@ -318,11 +291,11 @@ jobs:
               CONF=/var/ossec/etc/ossec.conf
               cp -f "$CONF" "${CONF}.bak.$(date +%s)" || true
 
-              # Ensure <auth> exists and is passwordless
+              # Ensure <auth> exists and is passwordless on 1515
               if grep -q "<auth>" "$CONF"; then
                 sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
                 # Remove any <password>...</password> inside <auth>
-                awk '\''BEGIN{in_auth=0} /<auth>/{in_auth=1} in_auth && /<password>.*<\/password>/{next} /<\/auth>/{in_auth=0} {print}'\'' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+                awk '"'"'BEGIN{in_auth=0} /<auth>/{in_auth=1} in_auth && /<password>.*<\/password>/{next} /<\/auth>/{in_auth=0} {print}'"'"' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
               else
                 awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>no</use_password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
@@ -333,43 +306,52 @@ jobs:
               else
                 awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
+
+              /var/ossec/bin/wazuh-control restart
             '
           done
 
-      - name: Ensure Services for managers
+      - name: Ensure Services (master-only 1515 + workers 1514)
         shell: bash
         run: |
           set -euo pipefail
+          # Remove the broad 'wazuh' Service if it exists to avoid 1515 hitting workers
+          kubectl -n "$NS" delete svc wazuh --ignore-not-found=true
+
           cat <<'EOF' | kubectl -n "$NS" apply -f -
           ---
+          # Authd on the MASTER only (1515)
           apiVersion: v1
           kind: Service
           metadata:
-            name: wazuh
-            labels: { app: wazuh-manager }
+            name: wazuh-authd-master
+            labels: { app: wazuh-manager, node-type: master }
           spec:
             type: ClusterIP
-            selector: { app: wazuh-manager }
+            selector: { app: wazuh-manager, node-type: master }
             ports:
-              - { name: authd,         port: 1515, protocol: TCP, targetPort: 1515 }
-              - { name: agents-events, port: 1514, protocol: TCP, targetPort: 1514 }
+              - { name: authd, port: 1515, targetPort: 1515, protocol: TCP }
           ---
+          # Agents' event channel (1514). Select workers; include master if you prefer.
           apiVersion: v1
           kind: Service
           metadata:
             name: wazuh-workers
-            labels: { app: wazuh-manager }
+            labels: { app: wazuh-manager, role: agents-events }
           spec:
             type: ClusterIP
-            selector: { app: wazuh-manager }
+            selector: { app: wazuh-manager, node-type: worker }
             ports:
-              - { name: agents-events, port: 1514, protocol: TCP, targetPort: 1514 }
-              - { name: authd,         port: 1515, protocol: TCP, targetPort: 1515 }
+              - { name: agents-events, port: 1514, targetPort: 1514, protocol: TCP }
           EOF
-          kubectl -n "$NS" get svc wazuh -o wide
-          kubectl -n "$NS" get endpoints wazuh -o wide || true
 
-      # === Agent side (passwordless enrollment)
+          echo "----- Services -----"
+          kubectl -n "$NS" get svc -o wide
+          echo "----- Endpoints -----"
+          kubectl -n "$NS" get endpoints wazuh-authd-master -o wide || true
+          kubectl -n "$NS" get endpoints wazuh-workers -o wide || true
+
+      # === Agent side (passwordless enrollment to master-only service) ===
       - name: Create Agent ConfigMap (passwordless enrollment)
         shell: bash
         run: |
@@ -384,7 +366,7 @@ jobs:
               </server>
               <enrollment>
                 <enabled>yes</enabled>
-                <manager_address>wazuh.wazuh.svc.cluster.local</manager_address>
+                <manager_address>wazuh-authd-master.wazuh.svc.cluster.local</manager_address>
                 <port>1515</port>
                 <use_password>no</use_password>
                 <ssl_verify_host>no</ssl_verify_host>
@@ -432,7 +414,7 @@ jobs:
                       - name: AUTHD_PORT
                         value: "1515"
                       - name: MANAGER_DNS
-                        value: "wazuh.wazuh.svc.cluster.local"
+                        value: "wazuh-authd-master.wazuh.svc.cluster.local"
                       - name: GROUPS
                         value: "kubernetes"
                     command: ["/bin/sh","-c"]
@@ -500,23 +482,14 @@ jobs:
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
 
-      - name: ✅ Wait for authd endpoints & probe service:1515
+      - name: ✅ Probe authd (1515) via master-only Service
         shell: bash
         run: |
           set -euo pipefail
-          echo "Waiting for endpoints on service/wazuh …"
-          for i in $(seq 1 60); do
-            EP="$(kubectl -n "$NS" get endpoints wazuh -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
-            if [ -n "$EP" ]; then echo "Endpoints: $EP"; break; fi
-            sleep 5
-          done
-          EP="$(kubectl -n "$NS" get endpoints wazuh -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
-          test -n "$EP" || { echo "::error::service/wazuh has no endpoints (check selector labels on manager pods)"; exit 1; }
-
-          echo "Probing TCP connectivity to wazuh:1515 from an in-cluster BusyBox…"
+          echo "Probing TCP connectivity to wazuh-authd-master:1515 …"
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
-          kubectl -n "$NS" run probe-authd --image=busybox:1.36 --restart=Never -- sh -c 'nslookup wazuh || true; for i in $(seq 1 10); do nc -vz -w 2 wazuh 1515 && exit 0; echo retry; sleep 3; done; exit 1'
-          kubectl -n "$NS" wait --for=condition=Ready pod/probe-authd --timeout=60s || true
+          kubectl -n "$NS" run probe-authd --image=busybox:1.36 --restart=Never -- \
+            sh -lc 'set -e; nslookup wazuh-authd-master || true; for i in $(seq 1 12); do nc -vz -w 2 wazuh-authd-master 1515 && exit 0; echo retry; sleep 2; done; exit 1'
           kubectl -n "$NS" logs pod/probe-authd || true
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
 
@@ -526,9 +499,6 @@ jobs:
         run: |
           set -euo pipefail
           PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
-          if [ -z "${PORT:-}" ]; then
-            PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].targetPort}' 2>/dev/null || true)"
-          fi
           if [ -z "${PORT:-}" ]; then
             PORT="$(kubectl -n "$NS" get deploy wazuh-dashboard -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || true)"
           fi
@@ -548,18 +518,11 @@ jobs:
           (pkill -f "port-forward .*:${PF_PORT}:" && sleep 1) || true
           echo "Starting PF: localhost:${PF_PORT} -> deploy/wazuh-dashboard:${TARGET_PORT}"
           nohup kubectl -n "${NS}" port-forward --address "${PF_BIND}" deploy/wazuh-dashboard "${PF_PORT}:${TARGET_PORT}" > portforward.log 2>&1 &
-          for i in $(seq 1 30); do
-            sleep 2
-            if curl -Is --connect-timeout 2 "http://localhost:${PF_PORT}" >/dev/null 2>&1 || \
-               curl -kIs --connect-timeout 2 "https://localhost:${PF_PORT}" >/dev/null 2>&1; then
-              break
-            fi
-          done
-          echo "::notice title=Browse Now::Open http://localhost:${PF_PORT} (or https://localhost:${PF_PORT} if TLS is enabled)"
+          echo "::notice title=Browse Now::Open http://localhost:${PF_PORT}"
 
       - name: Final status
         shell: bash
         run: |
           kubectl -n "$NS" get svc -o wide
-          kubectl -n "$NS" get endpoints wazuh -o wide || true
+          kubectl -n "$NS" get endpoints -o wide
           kubectl -n "$NS" get pods -o wide
