@@ -1,4 +1,4 @@
-name: Deploy Wazuh Agent (Fixed Connectivity)
+name: "Deploy Wazuh Agent (Fixed Connectivity)"
 
 on:
   workflow_dispatch:
