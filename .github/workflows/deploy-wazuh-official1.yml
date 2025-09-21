@@ -88,7 +88,7 @@ jobs:
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # ---------- SYSCTL: set and KEEP it running (and verifiable) ----------
+      # ---------- keep vm.max_map_count enforced & verifiable ----------
       - name: Ensure vm.max_map_count on all nodes (DaemonSet kept)
         shell: bash
         run: |
@@ -115,7 +115,7 @@ jobs:
                         mkdir -p /host-etc/sysctl.d
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
                         echo "node: $(hostname) vm.max_map_count=$(cat /host-proc/sys/vm/max_map_count)"
-                        # stay up so the value remains verifiable in this run
+                        # keep container up so value persists/visible during run
                         sleep 3600
                     volumeMounts:
                       - { name: host-proc, mountPath: /host-proc }
@@ -125,7 +125,6 @@ jobs:
                   - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
-          # give it a moment to schedule and set the value, then show logs
           sleep 5
           kubectl -n kube-system get pods -l app=wazuh-sysctl -o wide || true
           for p in $(kubectl -n kube-system get pods -l app=wazuh-sysctl -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
@@ -257,8 +256,7 @@ jobs:
             fi
           fi
 
-      # ---------- Optional HARD reset of indexer data ----------
-      - name: OPTIONAL: wipe ALL indexer PVCs (if set)
+      - name: "OPTIONAL: wipe ALL indexer PVCs (if set)"
         if: ${{ inputs.wipe_indexer_pvcs == 'true' }}
         shell: bash
         run: |
@@ -296,7 +294,6 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # ===== Patch the EXACT ConfigMaps used by running manager pods (passwordless) =====
       - name: Patch manager ossec.conf in live ConfigMaps (passwordless)
         shell: bash
         run: |
@@ -544,7 +541,6 @@ jobs:
           test -n "${PORT:-}" || { echo "::error::Could not determine dashboard port"; exit 1; }
           echo "dash_port=${PORT}" >> "$GITHUB_OUTPUT"
 
-      # ---------- Auto collect indexer logs if any container crashes ----------
       - name: Indexer quick logs (if crashloop)
         shell: bash
         run: |
