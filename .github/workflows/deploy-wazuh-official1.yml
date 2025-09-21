@@ -276,7 +276,28 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # ===== Managers: force passwordless (patch you requested) =====
+      # ===== NEW: Patch manager ConfigMaps so passwordless persists across restarts =====
+      - name: Make manager ConfigMaps passwordless (source of truth)
+        shell: bash
+        run: |
+          set -euo pipefail
+          NS="${NS:-wazuh}"
+          CMLS="$(kubectl -n "$NS" get sts -l app=wazuh-manager \
+            -o jsonpath='{range .items[*].spec.template.spec.volumes[*]}{.configMap.name}{"\n"}{end}' | sort -u | sed '/^$/d' || true)"
+          if [ -z "${CMLS}" ]; then
+            echo "::warning::No ConfigMaps referenced by manager StatefulSets were found."
+          fi
+          for CM in $CMLS; do
+            DATA="$(kubectl -n "$NS" get cm "$CM" -o jsonpath='{.data.ossec\.conf}' 2>/dev/null || true)"
+            if [ -n "$DATA" ] && echo "$DATA" | grep -q '<auth>'; then
+              echo "Patching ConfigMap: $CM"
+              kubectl -n "$NS" get cm "$CM" -o yaml \
+              | perl -0777 -pe 's#(<auth>.*?<port>)[0-9]+(</port>.*?<use_password>)[^<]+(</use_password>.*?</auth>)#${1}1515${2}no${3}#gs' \
+              | kubectl apply -f -
+            fi
+          done
+
+      # ===== Your requested in-pod patch (immediate) + purge authd.pass =====
       - name: Force passwordless on ALL managers (sed patch + purge authd.pass)
         shell: bash
         run: |
@@ -288,13 +309,10 @@ jobs:
               set -e
               f=/var/ossec/etc/ossec.conf
               cp "$f" "${f}.bak.$(date +%s)" || true
-              # Force port 1515 and passwordless inside <auth>…</auth>
               sed -i -E "/<auth>/,/<\/auth>/ s|<port>[0-9]+</port>|<port>1515</port>|" "$f"
               sed -i -E "/<auth>/,/<\/auth>/ s|<use_password>[^<]+</use_password>|<use_password>no</use_password>|" "$f"
-              # Remove any <password>…</password> line and purge authd.pass if present
               awk '"'"'BEGIN{in=0} /<auth>/{in=1} in && /<password>.*<\/password>/{next} /<\/auth>/{in=0} {print}'"'"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
               rm -f /var/ossec/etc/authd.pass || true
-              # Show resulting <auth> block
               echo "----- <auth> after patch (pod $(hostname)) -----"
               sed -n "/<auth>/,/<\\/auth>/p" "$f"
             '
