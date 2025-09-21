@@ -1,3 +1,5 @@
+# --- BEGIN FINAL WORKFLOW ---
+# (unchanged header/inputs)
 name: Deploy Wazuh (Official Kubernetes Manifests)
 
 on:
@@ -506,9 +508,9 @@ jobs:
           S1="$(kubectl -n "$NS" get secret wazuh-enroll-pass -o jsonpath='{.data.enroll_pass}' | base64 -d | h)"
           S2="$(kubectl -n "$NS" get secret wazuh-authd-pass  -o jsonpath='{.data.authd\.pass}' | base64 -d | h)"
           MPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager -o jsonpath='{.items[0].metadata.name}')"
-          F1="$(kubectl -n "$NS" exec "$MPOD" -c wazuh-manager -- sh -lc 'test -s /var/ossec/etc/authd.pass && sha256sum /var/ossec/etc/authd.pass | cut -d" " -f1 || echo ""' || true)"
+          F1="$(kubectl -n "$NS" exec "$MPOD" -c wazuh-manager -- sh -lc 'test -s /var/ossec/etc/authd.pass && sha256sum /var/ossec/etc/authd.pass | cut -d\" \" -f1 || echo \"\"' || true)"
           APOD="$(kubectl -n "$NS" get pod -l app=wazuh-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          E1="$(kubectl -n "$NS" exec "$APOD" -- sh -lc 'printf "%s" "${ENROLL_PASS:-}" | sha256sum | cut -d" " -f1' 2>/dev/null || echo "")"
+          E1="$(kubectl -n "$NS" exec "$APOD" -- sh -lc 'printf \"%s\" \"${ENROLL_PASS:-}\" | sha256sum | cut -d\" \" -f1' 2>/dev/null || echo \"\")"
           echo "hash(secret agent)  = $S1"
           echo "hash(secret manager)= $S2"
           echo "hash(manager file)  = $F1"
@@ -539,7 +541,7 @@ jobs:
 
           echo "Probing TCP connectivity to wazuh:1515 from an in-cluster BusyBox…"
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
-          kubectl -n "$NS" run probe-authd --image=busybox:1.36 --restart=Never -- sh -c 'for i in $(seq 1 10); do nc -vz -w 2 wazuh 1515 && exit 0; echo retry; sleep 3; done; exit 1'
+          kubectl -n "$NS" run probe-authd --image=busybox:1.36 --restart=Never -- sh -c 'nslookup wazuh || true; for i in $(seq 1 10); do nc -vz -w 2 wazuh 1515 && exit 0; echo retry; sleep 3; done; exit 1'
           kubectl -n "$NS" wait --for=condition=Ready pod/probe-authd --timeout=60s || true
           kubectl -n "$NS" logs pod/probe-authd || true
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
@@ -587,3 +589,4 @@ jobs:
           kubectl -n "$NS" get svc -o wide
           kubectl -n "$NS" get endpoints wazuh -o wide || true
           kubectl -n "$NS" get pods -o wide
+# --- END FINAL WORKFLOW ---
