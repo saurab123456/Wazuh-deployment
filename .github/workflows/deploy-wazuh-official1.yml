@@ -48,6 +48,15 @@ jobs:
           fi
           kubectl version --client=true | head -n 1
 
+      - name: Install yq (YAML CLI)
+        run: |
+          set -e
+          if ! command -v yq >/dev/null 2>&1; then
+            sudo curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+            sudo chmod +x /usr/local/bin/yq
+          fi
+          yq --version
+
       - name: Write kubeconfig from secret
         env:
           KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
@@ -168,6 +177,15 @@ jobs:
           echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
           echo "Resolved: $PICK"
 
+      - name: Build overlay with Kustomize
+        run: |
+          set -e
+          OVER="${{ steps.resolve.outputs.overlay_path }}"
+          kubectl kustomize "$OVER" > /tmp/wazuh-all.yaml
+          echo "Built manifest at /tmp/wazuh-all.yaml"
+          # Pre-delete dashboard deployment to avoid mismatch from prior failed runs
+          kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
+
       - name: Optional cleanup (delete UNBOUND PVCs only)
         run: |
           set -e
@@ -178,44 +196,28 @@ jobs:
             fi
           fi
 
-      - name: Apply overlay (skip StorageClass, StatefulSet, Kustomization)
+      - name: Apply non-StatefulSet resources (filter out StorageClass)
         run: |
           set -e
-          cd "${{ steps.resolve.outputs.overlay_path }}"
-          FILES="$(find . -type f \( -name '*.yaml' -o -name '*.yml' \))"
-          APPLY_LIST=""
-          for f in $FILES; do
-            # Skip known-problematic kinds and kustomize files
-            if grep -qi '^[[:space:]]*kind:[[:space:]]*StorageClass' "$f"; then echo "Skip StorageClass: $f"; continue; fi
-            if grep -qi '^[[:space:]]*kind:[[:space:]]*StatefulSet'  "$f"; then echo "Defer StatefulSet: $f"; continue; fi
-            if grep -qi '^[[:space:]]*kind:[[:space:]]*Kustomization' "$f" || echo "$f" | grep -qi 'kustomization\.ya\?ml$'; then echo "Skip Kustomization: $f"; continue; fi
-            APPLY_LIST="$APPLY_LIST $f"
-          done
-          if [ -n "$APPLY_LIST" ]; then
-            for f in $APPLY_LIST; do kubectl apply -f "$f"; done
+          # filter: everything except StorageClass and StatefulSet
+          yq -o=y e 'select(.kind != "StorageClass" and .kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sts-sc.yaml
+          if [ -s /tmp/wazuh-no-sts-sc.yaml ]; then
+            kubectl -n "$NS" apply -f /tmp/wazuh-no-sts-sc.yaml
           else
-            echo "No non-STS/non-SC/non-Kustomization manifests to apply."
+            echo "Nothing to apply in non-STS/SC set."
           fi
 
       - name: Recreate StatefulSets to avoid immutability errors
         run: |
           set -e
-          cd "${{ steps.resolve.outputs.overlay_path }}"
-          STS_FILES="$(grep -RIl --include='*.yml' --include='*.yaml' '^[[:space:]]*kind:[[:space:]]*StatefulSet' . || true)"
-          if [ -n "$STS_FILES" ]; then
-            for f in $STS_FILES; do
-              # Extract name safely (fallback to dry-run)
-              NAME="$(awk '/^[[:space:]]*metadata:[[:space:]]*$/,/^[^ ]/{if($1=="name:"){print $2; exit}}' "$f")"
-              if [ -z "$NAME" ]; then
-                NAME="$(kubectl create --dry-run=client -f "$f" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
-              fi
-              if [ -n "$NAME" ]; then
-                kubectl -n "$NS" delete statefulset "$NAME" --ignore-not-found=true
-              fi
-              kubectl apply -f "$f"
-            done
+          # grab sts names
+          yq -r e 'select(.kind == "StatefulSet") | .metadata.name' /tmp/wazuh-all.yaml > /tmp/sts-names.txt
+          if [ -s /tmp/sts-names.txt ]; then
+            xargs -r -a /tmp/sts-names.txt -I{} kubectl -n "$NS" delete statefulset {} --ignore-not-found=true
+            yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-sts.yaml
+            kubectl -n "$NS" apply -f /tmp/wazuh-sts.yaml
           else
-            echo "No StatefulSets found."
+            echo "No StatefulSets in build."
           fi
 
       - name: Wait for core components
