@@ -276,7 +276,7 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # ===== Patch the EXACT ConfigMaps used by running manager pods (your flow) =====
+      # ===== Patch the EXACT ConfigMaps used by running manager pods =====
       - name: Patch manager ossec.conf in live ConfigMaps (passwordless)
         shell: bash
         run: |
@@ -299,30 +299,29 @@ jobs:
 
           for CM in $CM_NAMES; do
             echo ">> Processing ConfigMap: $CM"
-            # Fetch full CM YAML so we preserve labels/annotations
             kubectl -n "$NS" get cm "$CM" -o yaml > "/tmp/${CM}.yaml"
 
-            # Extract ossec.conf to a temp file
-            if ! yq -r '.data."ossec.conf"' "/tmp/${CM}.yaml" > "/tmp/ossec.conf.cm"; then
+            yq -r '.data."ossec.conf"' "/tmp/${CM}.yaml" > /tmp/ossec.conf.cm || true
+            if [ ! -s /tmp/ossec.conf.cm ] || grep -qx 'null' /tmp/ossec.conf.cm; then
               echo "::warning::${CM} has no data.ossec.conf; skipping"
               continue
             fi
 
-            # Apply your sed/awk patch exactly within <auth>…</auth>
+            # Update within <auth>…</auth>
             sed -i -E '/<auth>/,/<\/auth>/ s|<use_password>[^<]+</use_password>|<use_password>no</use_password>|' /tmp/ossec.conf.cm
             sed -i -E '/<auth>/,/<\/auth>/ s|<port>[0-9]+</port>|<port>1515</port>|' /tmp/ossec.conf.cm
-            awk 'BEGIN{in=0} /<auth>/{in=1} in && /<password>.*<\/password>/{next} /<\/auth>/{in=0} {print}' /tmp/ossec.conf.cm > /tmp/ossec.conf.cm.new && mv /tmp/ossec.conf.cm.new /tmp/ossec.conf.cm
+            awk 'BEGIN{inauth=0} /<auth>/{inauth=1} inauth && /<password>.*<\/password>/{next} /<\/auth>/{inauth=0} {print}' /tmp/ossec.conf.cm > /tmp/ossec.conf.cm.new && mv /tmp/ossec.conf.cm.new /tmp/ossec.conf.cm
 
-            # Put it back into the CM and apply
+            # Put it back and apply
             yq -i '.data."ossec.conf" = load_str("/tmp/ossec.conf.cm")' "/tmp/${CM}.yaml"
             kubectl -n "$NS" apply -f "/tmp/${CM}.yaml"
 
-            # Quick visibility of the <auth> block after patch
-            awk 'BEGIN{in=0} /<auth>/{in=1} in{print} /<\/auth>/{in=0}' /tmp/ossec.conf.cm
+            # Show resulting block (no fail on print)
+            awk 'BEGIN{inauth=0} /<auth>/{inauth=1} inauth{print} /<\/auth>/{inauth=0}' /tmp/ossec.conf.cm || true
             echo
           done
 
-      # ===== Immediate in-pod patch & purge authd.pass (so agents can enroll now) =====
+      # ===== Immediate in-pod patch & purge authd.pass =====
       - name: Force passwordless on ALL managers (in-pod sed + purge authd.pass)
         shell: bash
         run: |
@@ -336,7 +335,7 @@ jobs:
               cp "$f" "${f}.bak.$(date +%s)" || true
               sed -i -E "/<auth>/,/<\/auth>/ s|<port>[0-9]+</port>|<port>1515</port>|" "$f"
               sed -i -E "/<auth>/,/<\/auth>/ s|<use_password>[^<]+</use_password>|<use_password>no</use_password>|" "$f"
-              awk '"'"'BEGIN{in=0} /<auth>/{in=1} in && /<password>.*<\/password>/{next} /<\/auth>/{in=0} {print}'"'"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              awk '"'"'BEGIN{inauth=0} /<auth>/{inauth=1} inauth && /<password>.*<\/password>/{next} /<\/auth>/{inauth=0} {print}'"'"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
               rm -f /var/ossec/etc/authd.pass || true
               echo "----- <auth> after patch (pod $(hostname)) -----"
               sed -n "/<auth>/,/<\\/auth>/p" "$f"
