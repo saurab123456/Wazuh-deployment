@@ -1,6 +1,4 @@
-# --- BEGIN FINAL WORKFLOW ---
-# (unchanged header/inputs)
-name: Deploy Wazuh (Official Kubernetes Manifests)
+name: Deploy Wazuh (Official Kubernetes Manifests, passwordless)
 
 on:
   workflow_dispatch:
@@ -38,8 +36,6 @@ jobs:
       OVERLAY_CHOICE: ${{ inputs.overlay }}
       CLEANUP_UNBOUND_PVCS: ${{ inputs.cleanup_unbound_pvcs }}
       LOCAL_FORWARD_PORT: ${{ inputs.local_forward_port }}
-      WAZUH_ENROLL_PASS: ${{ secrets.WAZUH_ENROLL_PASS }}
-      WAZUH_ENROLL_PASS_FALLBACK: "A@min@123"
 
     steps:
       - name: Checkout repo
@@ -264,8 +260,8 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # === Managers: enable passworded enrollment and mount authd.pass ===
-      - name: Enable authd with password on ALL managers
+      # === Managers: enable AUTHD (passwordless) ===
+      - name: Enable authd (passwordless) on ALL managers
         env:
           MANAGER_SELECTOR: app=wazuh-manager
         shell: bash
@@ -274,15 +270,28 @@ jobs:
           PODS=$(kubectl -n "$NS" get pods -l "$MANAGER_SELECTOR" -o name)
           test -n "$PODS" || { echo "No manager pods found"; exit 1; }
           for POD in $PODS; do
+            echo ">> Patching $POD"
             kubectl -n "$NS" exec "$POD" -c wazuh-manager -- sh -lc '
               set -e
               CONF=/var/ossec/etc/ossec.conf
               cp -f "$CONF" "${CONF}.bak.$(date +%s)" || true
+
+              # Ensure <auth> exists and is passwordless
               if grep -q "<auth>" "$CONF"; then
-                sed -i "s#<use_password>.*</use_password>#<use_password>yes</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
+                sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
+                # Remove any <password>...</password> line inside <auth>
+                awk '\''
+                  BEGIN{in_auth=0}
+                  /<auth>/{in_auth=1}
+                  in_auth && /<password>.*<\/password>/{next}
+                  /<\/auth>/{in_auth=0}
+                  {print}
+                '\'' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
               else
-                awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>yes</use_password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
+                awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>no</use_password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
+
+              # Ensure <remote> block exists for agent events (1514/tcp)
               if grep -q "<remote>" "$CONF"; then
                 sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
               else
@@ -291,26 +300,10 @@ jobs:
             '
           done
 
-      - name: Create/Update manager authd.pass Secret and mount into managers
+      - name: Remove any enrollment/password secrets (not used)
         shell: bash
         run: |
-          set -euo pipefail
-          PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
-
-          kubectl -n "$NS" create secret generic wazuh-authd-pass \
-            --from-literal=authd.pass="$PASS" \
-            -o yaml --dry-run=client | kubectl apply -f -
-
-          patch_sts () {
-            local sts="$1"
-            kubectl -n "$NS" get sts "$sts" >/dev/null 2>&1 || return 0
-            kubectl -n "$NS" patch sts "$sts" --type='json' -p='[
-              {"op":"add","path":"/spec/template/spec/volumes/-","value":{"name":"authd-pass","secret":{"secretName":"wazuh-authd-pass"}}},
-              {"op":"add","path":"/spec/template/spec/containers/0/volumeMounts/-","value":{"name":"authd-pass","mountPath":"/var/ossec/etc/authd.pass","subPath":"authd.pass","readOnly":true}}
-            ]' || true
-          }
-          patch_sts wazuh-manager-master
-          patch_sts wazuh-manager-worker
+          kubectl -n "$NS" delete secret wazuh-authd-pass wazuh-enroll-pass --ignore-not-found=true || true
 
       - name: Restart manager StatefulSets (safe)
         shell: bash
@@ -323,45 +316,19 @@ jobs:
           done
           kubectl -n "$NS" get pods -l app=wazuh-manager -o wide
 
-      - name: Create/Update enroll password Secret + Agent ConfigMap
+      - name: Verify managers are listening on 1515 (authd)
         shell: bash
         run: |
           set -euo pipefail
-          PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+          for P in $(kubectl -n "$NS" get pod -l app=wazuh-manager -o name); do
+            echo ">> Checking $P"
+            kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc 'ss -Hntl | grep -E "LISTEN.+:1515" || netstat -tln | grep ":1515"'
+          done
 
-          kubectl -n "$NS" create secret generic wazuh-enroll-pass \
-            --from-literal=enroll_pass="$PASS" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-          cat > /tmp/agent-ossec.conf <<EOF
-          <ossec_config>
-            <client>
-              <server>
-                <address>wazuh-workers.wazuh.svc.cluster.local</address>
-                <port>1514</port>
-                <protocol>tcp</protocol>
-              </server>
-              <enrollment>
-                <enabled>yes</enabled>
-                <manager_address>wazuh.wazuh.svc.cluster.local</manager_address>
-                <port>1515</port>
-                <use_password>yes</use_password>
-                <password>${PASS}</password>
-                <ssl_verify_host>no</ssl_verify_host>
-                <auto_negotiate>no</auto_negotiate>
-              </enrollment>
-            </client>
-          </ossec_config>
-          EOF
-          kubectl -n "$NS" create configmap wazuh-agent-ossec \
-            --from-file=ossec.conf=/tmp/agent-ossec.conf \
-            -o yaml --dry-run=client | kubectl apply -f -
-
-      - name: Ensure Services for manager (master/workers)
+      - name: Ensure Services for managers
         shell: bash
         run: |
           set -euo pipefail
-          # Select ALL wazuh-manager pods to avoid relying on nonstandard labels.
           cat <<'EOF' | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
@@ -391,7 +358,35 @@ jobs:
           kubectl -n "$NS" get svc wazuh -o wide
           kubectl -n "$NS" get endpoints wazuh -o wide || true
 
-      - name: Create or patch Agent DaemonSet for passworded enrollment
+      # === Agent side (passwordless enrollment)
+      - name: Create Agent ConfigMap (passwordless enrollment)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/agent-ossec.conf <<'EOF'
+          <ossec_config>
+            <client>
+              <server>
+                <address>wazuh-workers.wazuh.svc.cluster.local</address>
+                <port>1514</port>
+                <protocol>tcp</protocol>
+              </server>
+              <enrollment>
+                <enabled>yes</enabled>
+                <manager_address>wazuh.wazuh.svc.cluster.local</manager_address>
+                <port>1515</port>
+                <use_password>no</use_password>
+                <ssl_verify_host>no</ssl_verify_host>
+                <auto_negotiate>no</auto_negotiate>
+              </enrollment>
+            </client>
+          </ossec_config>
+          EOF
+          kubectl -n "$NS" create configmap wazuh-agent-ossec \
+            --from-file=ossec.conf=/tmp/agent-ossec.conf \
+            -o yaml --dry-run=client | kubectl apply -f -
+
+      - name: Deploy Agent DaemonSet (agent-auth without -P)
         shell: bash
         run: |
           set -euo pipefail
@@ -429,11 +424,6 @@ jobs:
                         value: "wazuh.wazuh.svc.cluster.local"
                       - name: GROUPS
                         value: "kubernetes"
-                      - name: ENROLL_PASS
-                        valueFrom:
-                          secretKeyRef:
-                            name: wazuh-enroll-pass
-                            key: enroll_pass
                     command: ["/bin/sh","-c"]
                     args:
                       - |
@@ -446,9 +436,9 @@ jobs:
                         enroll() {
                           echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS})…"
                           if [ -n "${GROUPS}" ]; then
-                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" -P "${ENROLL_PASS}"
+                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}"
                           else
-                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -P "${ENROLL_PASS}"
+                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}"
                           fi
                         }
                         if [ ! -s /var/ossec/etc/client.keys ]; then
@@ -498,33 +488,6 @@ jobs:
           EOF
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
-
-      - name: 🔎 Sanity-check enrollment password (hash compare)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Comparing agent Secret vs manager file vs agent env (hashes only)…"
-          h() { sha256sum | cut -d' ' -f1; }
-          S1="$(kubectl -n "$NS" get secret wazuh-enroll-pass -o jsonpath='{.data.enroll_pass}' | base64 -d | h)"
-          S2="$(kubectl -n "$NS" get secret wazuh-authd-pass  -o jsonpath='{.data.authd\.pass}' | base64 -d | h)"
-          MPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager -o jsonpath='{.items[0].metadata.name}')"
-          F1="$(kubectl -n "$NS" exec "$MPOD" -c wazuh-manager -- sh -lc 'test -s /var/ossec/etc/authd.pass && sha256sum /var/ossec/etc/authd.pass | cut -d\" \" -f1 || echo \"\"' || true)"
-          APOD="$(kubectl -n "$NS" get pod -l app=wazuh-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          E1="$(kubectl -n "$NS" exec "$APOD" -- sh -lc 'printf \"%s\" \"${ENROLL_PASS:-}\" | sha256sum | cut -d\" \" -f1' 2>/dev/null || echo \"\")"
-          echo "hash(secret agent)  = $S1"
-          echo "hash(secret manager)= $S2"
-          echo "hash(manager file)  = $F1"
-          echo "hash(agent env)     = $E1"
-          if [ "$S1" != "$S2" ]; then
-            echo "::error::Mismatch between wazuh-enroll-pass and wazuh-authd-pass secrets."; exit 1
-          fi
-          if [ -z "$F1" ] || [ -z "$E1" ]; then
-            echo "::warning::Manager authd.pass or agent ENROLL_PASS not yet readable (warm-up). Continuing."
-          elif [ "$S1" != "$F1" ] || [ "$S1" != "$E1" ]; then
-            echo "::warning::Secrets match but file/env differ. A rollout may still be pending."
-          else
-            echo "✅ All hashes match."
-          fi
 
       - name: ✅ Wait for authd endpoints & probe service:1515
         shell: bash
@@ -589,4 +552,3 @@ jobs:
           kubectl -n "$NS" get svc -o wide
           kubectl -n "$NS" get endpoints wazuh -o wide || true
           kubectl -n "$NS" get pods -o wide
-# --- END FINAL WORKFLOW ---
