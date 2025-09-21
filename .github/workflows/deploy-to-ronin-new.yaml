@@ -25,7 +25,7 @@ jobs:
       NS: wazuh
       KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
       WAZUH_K8S_TAG: ${{ inputs.wazuh_tag }}
-      OVERLAY: ${{ inputs.overlay }}
+      OVERLAY_CHOICE: ${{ inputs.overlay }}
 
     steps:
       - name: Checkout (this repo)
@@ -54,7 +54,7 @@ jobs:
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # ---------------- SYSCTL: vm.max_map_count ----------------
+      # ------------ sysctl: vm.max_map_count ------------
       - name: Apply sysctl DaemonSet (vm.max_map_count=262144 on all nodes)
         run: |
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
@@ -63,16 +63,13 @@ jobs:
           metadata:
             name: wazuh-sysctl
             namespace: kube-system
-            labels:
-              app: wazuh-sysctl
+            labels: { app: wazuh-sysctl }
           spec:
             selector:
-              matchLabels:
-                app: wazuh-sysctl
+              matchLabels: { app: wazuh-sysctl }
             template:
               metadata:
-                labels:
-                  app: wazuh-sysctl
+                labels: { app: wazuh-sysctl }
               spec:
                 hostPID: true
                 tolerations:
@@ -80,44 +77,30 @@ jobs:
                 containers:
                   - name: sysctl
                     image: busybox:1.36
-                    securityContext:
-                      privileged: true
+                    securityContext: { privileged: true }
                     command: ["/bin/sh","-c"]
                     args:
                       - |
                         set -e
-                        # Apply live value on host
                         echo 262144 > /host-proc/sys/vm/max_map_count
-                        # Persist across reboots
                         mkdir -p /host-etc/sysctl.d
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
                         echo "vm.max_map_count now: $(cat /host-proc/sys/vm/max_map_count)"
-                        # Keep container alive briefly so logs can be read before we delete the DS
-                        sleep 180
+                        sleep 120
                     volumeMounts:
-                      - name: host-proc
-                        mountPath: /host-proc
-                      - name: host-etc
-                        mountPath: /host-etc
+                      - { name: host-proc, mountPath: /host-proc }
+                      - { name: host-etc,  mountPath: /host-etc  }
                 restartPolicy: Always
                 volumes:
-                  - name: host-proc
-                    hostPath:
-                      path: /proc
-                      type: Directory
-                  - name: host-etc
-                    hostPath:
-                      path: /etc
-                      type: Directory
+                  - { name: host-proc, hostPath: { path: /proc, type: Directory } }
+                  - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
 
       - name: Wait & verify sysctl DS
         run: |
           kubectl -n kube-system rollout status ds/wazuh-sysctl --timeout=180s || true
-          echo "---- DaemonSet pods ----"
           kubectl -n kube-system get pods -l app=wazuh-sysctl -o wide
-          echo "---- vm.max_map_count from each pod ----"
           for p in $(kubectl -n kube-system get pods -l app=wazuh-sysctl -o name); do
             echo "# $p"
             kubectl -n kube-system logs "$p" || true
@@ -126,7 +109,7 @@ jobs:
       - name: Cleanup sysctl DS (keeps /etc/sysctl.d/99-wazuh.conf on nodes)
         run: |
           kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
-      # ---------------- END SYSCTL ----------------
+      # ------------ end sysctl ------------
 
       - name: Ensure dynamic StorageClass alias 'wazuh-storage'
         run: |
@@ -151,8 +134,7 @@ jobs:
           cat <<EOF | kubectl apply -f -
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
-          metadata:
-            name: wazuh-storage
+          metadata: { name: wazuh-storage }
           provisioner: ${TARGET_PROV}
           reclaimPolicy: Delete
           volumeBindingMode: WaitForFirstConsumer
@@ -169,24 +151,50 @@ jobs:
           echo "Fetched wazuh-kubernetes@$WAZUH_K8S_TAG"
           ls -la wazuh-kubernetes
 
-      - name: Determine overlay path
-        id: pick
+      - name: Resolve overlay path (auto-detect layout)
+        id: resolve
         run: |
-          case "$OVERLAY" in
-            single-node)        echo "overlay_path=single-node"        >> "$GITHUB_OUTPUT" ;;
-            production-cluster) echo "overlay_path=production_cluster" >> "$GITHUB_OUTPUT" ;;
-            *) echo "::error::Unknown overlay: $OVERLAY"; exit 1 ;;
+          set -euo pipefail
+          case "$OVERLAY_CHOICE" in
+            single-node)        want1="single-node"; want2="single_node";;
+            production-cluster) want1="production_cluster"; want2="production-cluster";;
+            *) echo "::error::Unknown overlay choice: $OVERLAY_CHOICE"; exit 1;;
           esac
+
+          candidates=(
+            "wazuh-kubernetes/${want1}"
+            "wazuh-kubernetes/${want2}"
+            "wazuh-kubernetes/wazuh/${want1}"
+            "wazuh-kubernetes/wazuh/${want2}"
+            "wazuh-kubernetes/kubernetes/${want1}"
+            "wazuh-kubernetes/kubernetes/${want2}"
+          )
+
+          found=""
+          for p in "${candidates[@]}"; do
+            if [ -d "$p" ]; then found="$p"; break; fi
+          done
+
+          if [ -z "$found" ]; then
+            echo "::error::Could not find overlay directory. Tried:"
+            printf ' - %s\n' "${candidates[@]}"
+            echo "Repo tree:"; ls -laR wazuh-kubernetes | sed -n '1,200p'
+            exit 1
+          fi
+
+          echo "overlay_path=$found" >> "$GITHUB_OUTPUT"
+          echo "Resolved overlay path: $found"
 
       - name: Inject namespace if missing (idempotent)
         run: |
           set -euo pipefail
-          cd wazuh-kubernetes/${{ steps.pick.outputs.overlay_path }}
-          for f in $(find . -name '*.yaml' -o -name '*.yml'); do
+          cd "${{ steps.resolve.outputs.overlay_path }}"
+          # add namespace under metadata if not present in a file
+          for f in $(find . -type f \( -name '*.yaml' -o -name '*.yml' \)); do
             if ! grep -qE '^[[:space:]]*namespace:' "$f"; then
               awk -v ns="$NS" '
                 BEGIN{inmeta=0}
-                /^metadata:/ {print; inmeta=1; next}
+                /^metadata:[[:space:]]*$/ {print; inmeta=1; next}
                 inmeta==1 && !printed && $0 ~ /^[[:space:]]{2}name:/ {print; print "  namespace: " ns; printed=1; next}
                 {print}
               ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
@@ -195,7 +203,7 @@ jobs:
 
       - name: Apply official manifests
         run: |
-          kubectl apply -f wazuh-kubernetes/${{ steps.pick.outputs.overlay_path }}/
+          kubectl apply -f "${{ steps.resolve.outputs.overlay_path }}/"
 
       - name: Wait for core components
         run: |
@@ -219,7 +227,7 @@ jobs:
           PORT=$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.spec.ports[0].nodePort}')
           NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' | head -n1)
           echo "🌐 Wazuh Dashboard: https://${NODE_IP}:${PORT}"
-          echo "ℹ️  Accept the self-signed certificate warning on first visit."
+          echo "ℹ️ Accept the self-signed certificate warning on first visit."
 
       - name: Final status
         run: |
