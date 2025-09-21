@@ -43,8 +43,7 @@ jobs:
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER="$(curl -sS https://dl.k8s.io/release/stable.txt)"
             curl -sSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
-            chmod +x kubectl
-            sudo mv kubectl /usr/local/bin/
+            chmod +x kubectl && sudo mv kubectl /usr/local/bin/
           fi
           kubectl version --client=true | head -n 1
 
@@ -177,13 +176,55 @@ jobs:
           echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
           echo "Resolved: $PICK"
 
+      # NEW: generate self-signed TLS certs expected by Kustomize
+      - name: Generate self-signed indexer certs (for Kustomize)
+        run: |
+          set -e
+          CERTDIR="${{ github.workspace }}/wazuh-kubernetes/wazuh/certs/indexer_cluster"
+          mkdir -p "$CERTDIR"
+          # OpenSSL config for SANs
+          cat > /tmp/wazuh-openssl.cnf <<'CONF'
+          [req]
+          default_bits=2048
+          prompt=no
+          default_md=sha256
+          req_extensions = v3_req
+          distinguished_name=req_dn
+          [req_dn]
+          CN=placeholder
+          [v3_req]
+          basicConstraints = CA:FALSE
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth, clientAuth
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = wazuh-indexer
+          DNS.2 = wazuh-indexer.wazuh.svc
+          DNS.3 = wazuh-indexer-0
+          DNS.4 = localhost
+          IP.1  = 127.0.0.1
+          CONF
+          # Root CA
+          openssl genrsa -out "$CERTDIR/root-ca-key.pem" 4096
+          openssl req -x509 -new -key "$CERTDIR/root-ca-key.pem" -sha256 -days 3650 -subj "/CN=Wazuh Root CA" -out "$CERTDIR/root-ca.pem"
+          sign() {
+            local name="$1"
+            openssl genrsa -out "$CERTDIR/${name}-key.pem" 2048
+            openssl req -new -key "$CERTDIR/${name}-key.pem" -out "$CERTDIR/${name}.csr" -config /tmp/wazuh-openssl.cnf
+            openssl x509 -req -in "$CERTDIR/${name}.csr" -CA "$CERTDIR/root-ca.pem" -CAkey "$CERTDIR/root-ca-key.pem" -CAcreateserial -out "$CERTDIR/${name}.pem" -days 825 -sha256 -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
+            rm -f "$CERTDIR/${name}.csr"
+          }
+          for n in admin dashboard node filebeat; do sign "$n"; done
+          # List generated files
+          ls -l "$CERTDIR"
+
       - name: Build overlay with Kustomize
         run: |
           set -e
           OVER="${{ steps.resolve.outputs.overlay_path }}"
           kubectl kustomize "$OVER" > /tmp/wazuh-all.yaml
-          echo "Built manifest at /tmp/wazuh-all.yaml"
-          # Pre-delete dashboard deployment to avoid mismatch from prior failed runs
+          echo "Built: /tmp/wazuh-all.yaml"
+          # Clean prior bad dashboard state, if any
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
       - name: Optional cleanup (delete UNBOUND PVCs only)
@@ -199,7 +240,6 @@ jobs:
       - name: Apply non-StatefulSet resources (filter out StorageClass)
         run: |
           set -e
-          # filter: everything except StorageClass and StatefulSet
           yq -o=y e 'select(.kind != "StorageClass" and .kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sts-sc.yaml
           if [ -s /tmp/wazuh-no-sts-sc.yaml ]; then
             kubectl -n "$NS" apply -f /tmp/wazuh-no-sts-sc.yaml
@@ -210,7 +250,6 @@ jobs:
       - name: Recreate StatefulSets to avoid immutability errors
         run: |
           set -e
-          # grab sts names
           yq -r e 'select(.kind == "StatefulSet") | .metadata.name' /tmp/wazuh-all.yaml > /tmp/sts-names.txt
           if [ -s /tmp/sts-names.txt ]; then
             xargs -r -a /tmp/sts-names.txt -I{} kubectl -n "$NS" delete statefulset {} --ignore-not-found=true
