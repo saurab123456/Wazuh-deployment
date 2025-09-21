@@ -1,4 +1,4 @@
-name: Deploy Wazuh Agent (passwordless)
+name: Deploy Wazuh Agent (password)
 
 on:
   workflow_dispatch:
@@ -24,6 +24,8 @@ jobs:
       IMAGE: ghcr.io/saurab123456/wazuh-agent:4.12.0
       AUTHD_PORT: "1515"   # manager authd (enrollment)
       EVENTS_PORT: "1514"  # remoted/events (kept for clarity)
+      WAZUH_ENROLL_PASS: ${{ secrets.WAZUH_ENROLL_PASS }}
+      WAZUH_ENROLL_PASS_FALLBACK: "A@min@123"
 
     steps:
       - name: Checkout
@@ -68,70 +70,7 @@ jobs:
           kubectl -n "$NS" wait --for=condition=Ready "pod/$MPOD" --timeout=180s || true
           [ -n "$WPOD" ] && kubectl -n "$NS" wait --for=condition=Ready "pod/$WPOD" --timeout=180s || true
 
-      - name: Patch manager config (passwordless authd 1515 + debug dump)
-        shell: bash
-        run: |
-          set -euo pipefail
-          . "$GITHUB_ENV" || true
-
-          patch_conf () {
-            local POD="$1"
-            [ -z "$POD" ] && return 0
-            echo "=== BEFORE ($POD) auth section ==="
-            kubectl -n "$NS" exec "$POD" -- sh -lc 'F=/var/ossec/etc/ossec.conf; [ -f "$F" ] && sed -n "/<auth>/,/<\\/auth>/p" "$F" || echo "No $F"'
-
-            echo "Patching ossec.conf inside $POD"
-            kubectl -n "$NS" exec "$POD" -- sh -lc '
-              set -e
-              F=/var/ossec/etc/ossec.conf
-              [ -f "$F" ] || { echo "No $F in pod"; exit 1; }
-              cp -f "$F" "$F.bak" || true
-
-              # ensure <auth> enabled
-              if ! grep -q "<disabled>no</disabled>" "$F"; then
-                sed -i "/<auth>/,/<\\/auth>/ s#<disabled>.*</disabled>#<disabled>no</disabled>#g" "$F"
-              fi
-
-              # ensure port 1515
-              if ! grep -q "<port>1515</port>" "$F"; then
-                sed -i "/<auth>/,/<\\/auth>/ s#<port>.*</port>#<port>1515</port>#g" "$F"
-              fi
-
-              # disable password usage
-              if grep -q "<use_password>yes</use_password>" "$F"; then
-                sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#g" "$F"
-              fi
-              if ! grep -q "<use_password>no</use_password>" "$F"; then
-                awk '"'"'{
-                  print
-                  if ($0 ~ /<auth>/) { ins=1 }
-                  else if (ins && $0 ~ /<\/auth>/) { print "    <use_password>no</use_password>"; ins=0 }
-                }'"'"' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
-              fi
-
-              echo "Restarting wazuh-manager (in-pod)…"
-              /var/ossec/bin/wazuh-control restart || true
-            '
-
-            echo "=== AFTER ($POD) auth section ==="
-            kubectl -n "$NS" exec "$POD" -- sh -lc 'sed -n "/<auth>/,/<\\/auth>/p" /var/ossec/etc/ossec.conf || true'
-
-            echo "Recreating pod $POD for clean start…"
-            kubectl -n "$NS" delete pod "$POD" --wait=true
-          }
-
-          patch_conf "${MASTER_POD:-}"
-          patch_conf "${WORKER_POD:-}"
-
-          kubectl -n "$NS" rollout status sts/wazuh-manager-master --timeout=300s || true
-          kubectl -n "$NS" rollout status sts/wazuh-manager-worker --timeout=300s || true
-
-          NEWM="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=master -o jsonpath="{.items[0].metadata.name}" || true)"
-          echo "MASTER_POD=$NEWM" >> "$GITHUB_ENV"
-          NEWW="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath="{.items[0].metadata.name}" || true)"
-          [ -n "$NEWW" ] && echo "WORKER_POD=$NEWW" >> "$GITHUB_ENV"
-
-      - name: Verify authd and remoted listening
+      - name: Verify authd and remoted listening (informational)
         shell: bash
         run: |
           set -euo pipefail
@@ -143,12 +82,14 @@ jobs:
             kubectl -n "$NS" logs "$WORKER_POD" --tail=500 | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" || true
           fi
 
-      - name: Apply Services + Agent ConfigMap + DaemonSet (enroll to MASTER)
+      - name: Apply Services + Agent ConfigMap + DaemonSet (passworded enroll to MASTER)
         shell: bash
         run: |
           set -euo pipefail
-          # Quote heredoc so shell doesn't expand ${NODE_NAME}, etc.; envsubst only fills IMAGE & AUTHD_PORT
-          cat <<'EOF' | envsubst '${IMAGE} ${AUTHD_PORT}' | kubectl -n "$NS" apply -f -
+          PASS="${WAZUH_ENROLL_PASS:-}"; if [ -z "$PASS" ]; then PASS="${WAZUH_ENROLL_PASS_FALLBACK}"; fi
+
+          # Services for in-cluster communication
+          cat <<'EOF' | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
           kind: Service
@@ -173,41 +114,53 @@ jobs:
             ports:
               - { name: agents-events, port: 1514, protocol: TCP, targetPort: 1514 }
               - { name: authd,         port: 1515, protocol: TCP, targetPort: 1515 }
-          ---
-          apiVersion: v1
-          kind: ConfigMap
-          metadata:
-            name: wazuh-agent-ossec
-          data:
-            ossec.conf: |
-              <ossec_config>
-                <client>
-                  <server>
-                    <!-- enroll to MASTER first -->
-                    <address>wazuh.wazuh.svc.cluster.local</address>
-                    <port>1514</port>
-                    <protocol>tcp</protocol>
-                  </server>
-                </client>
+          EOF
 
-                <!-- K8s logs (adjust paths if needed) -->
-                <localfile>
-                  <location>/host/var/log/containers/*.log</location>
-                  <log_format>syslog</log_format>
-                  <only-future-events>yes</only-future-events>
-                </localfile>
-                <localfile>
-                  <location>/host/var/log/pods/*/*/*.log</location>
-                  <log_format>syslog</log_format>
-                  <only-future-events>yes</only-future-events>
-                </localfile>
-                <localfile>
-                  <location>/host/var/log/syslog</location>
-                  <log_format>syslog</log_format>
-                  <only-future-events>yes</only-future-events>
-                </localfile>
-              </ossec_config>
-          ---
+          # Agent ossec.conf includes password-based enrollment
+          cat > /tmp/agent-ossec.conf <<EOF
+          <ossec_config>
+            <client>
+              <server>
+                <!-- enroll to MASTER first -->
+                <address>wazuh.wazuh.svc.cluster.local</address>
+                <port>1514</port>
+                <protocol>tcp</protocol>
+              </server>
+              <enrollment>
+                <enabled>yes</enabled>
+                <manager_address>wazuh.wazuh.svc.cluster.local</manager_address>
+                <port>1515</port>
+                <use_password>yes</use_password>
+                <password>${PASS}</password>
+                <ssl_verify_host>no</ssl_verify_host>
+                <auto_negotiate>no</auto_negotiate>
+              </enrollment>
+            </client>
+
+            <!-- K8s logs (adjust paths if needed) -->
+            <localfile>
+              <location>/host/var/log/containers/*.log</location>
+              <log_format>syslog</log_format>
+              <only-future-events>yes</only-future-events>
+            </localfile>
+            <localfile>
+              <location>/host/var/log/pods/*/*/*.log</location>
+              <log_format>syslog</log_format>
+              <only-future-events>yes</only-future-events>
+            </localfile>
+            <localfile>
+              <location>/host/var/log/syslog</location>
+              <log_format>syslog</log_format>
+              <only-future-events>yes</only-future-events>
+            </localfile>
+          </ossec_config>
+          EOF
+
+          kubectl -n "$NS" create configmap wazuh-agent-ossec \
+            --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
+
+          # DaemonSet with agent-auth -P (password)
+          cat <<'EOF' | envsubst '${IMAGE} ${AUTHD_PORT}' | kubectl -n "$NS" apply -f -
           apiVersion: apps/v1
           kind: DaemonSet
           metadata:
@@ -240,6 +193,11 @@ jobs:
                         value: "wazuh.wazuh.svc.cluster.local"
                       - name: GROUPS
                         value: "kubernetes"
+                      - name: ENROLL_PASS
+                        valueFrom:
+                          secretKeyRef:
+                            name: wazuh-enroll-pass
+                            key: enroll_pass
                     command: ["/bin/sh","-c"]
                     args:
                       - |
@@ -254,9 +212,9 @@ jobs:
                         enroll() {
                           echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS})…"
                           if [ -n "${GROUPS}" ]; then
-                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}"
+                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" -P "${ENROLL_PASS}"
                           else
-                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}"
+                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -P "${ENROLL_PASS}"
                           fi
                         }
 
@@ -308,33 +266,14 @@ jobs:
                   - { name: varlog,           hostPath: { path: /var/log,            type: Directory } }
           EOF
 
+          # Ensure the Secret referenced above exists (created by the cluster deploy workflow).
+          # Create it here too just in case:
+          kubectl -n "$NS" create secret generic wazuh-enroll-pass \
+            --from-literal=enroll_pass="$PASS" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
-
-      - name: Expose Wazuh Dashboard on 30443 (NodePort)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Create/update a NodePort Service bound to port 30443 -> targetPort 5601
-          cat <<'EOF' | kubectl -n "$NS" apply -f -
-          apiVersion: v1
-          kind: Service
-          metadata:
-            name: wazuh-dashboard-nodeport
-            labels:
-              app: wazuh-dashboard
-          spec:
-            type: NodePort
-            selector:
-              app: wazuh-dashboard
-            ports:
-              - name: https
-                port: 443
-                targetPort: 5601
-                nodePort: 30443
-                protocol: TCP
-          EOF
-          echo "Dashboard should be reachable at: https://<NODE-IP>:30443 (self-signed cert likely)."
 
       - name: Verify enrollment on master
         shell: bash
@@ -369,7 +308,7 @@ jobs:
           kubectl -n "$NS" get pods -o wide || true
           echo
           echo "---- Services"
-          kubectl -n "$NS" get svc wazuh wazuh-workers wazuh-dashboard-nodeport -o wide || true
+          kubectl -n "$NS" get svc wazuh wazuh-workers -o wide || true
           echo
           echo "---- Manager logs (ports)"
           kubectl -n "$NS" logs "$MASTER_POD" --tail=300 | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" | tail -n 80 || true
