@@ -1,70 +1,56 @@
-name: Deploy Wazuh to Ronin (Self-Hosted)
+name: Deploy Wazuh (Official Kubernetes Manifests)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - "wazuh-kubernetes/**"
-      - "k8s/**"
-      - ".github/workflows/deploy-wazuh-ronin-selfhosted.yaml"
+    inputs:
+      overlay:
+        description: "Which official overlay to apply"
+        required: true
+        default: single-node
+        type: choice
+        options:
+          - single-node
+          - production-cluster
+      wazuh_tag:
+        description: "wazuh-kubernetes repo tag (e.g., v4.12.0)"
+        required: true
+        default: v4.12.0
 
 jobs:
   deploy:
+    # Run on your Ronin self-hosted runner
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     env:
-      # --- YOUR SETTINGS ---
       NS: wazuh
-      WAZUH_TAG: v4.12.0
-      DASH_PORT: 32563
-      # kubeconfig gets written here:
       KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
+      WAZUH_K8S_TAG: ${{ inputs.wazuh_tag }}
+      OVERLAY: ${{ inputs.overlay }}
 
     steps:
-      - name: Checkout repo
+      - name: Checkout (this repo)
         uses: actions/checkout@v4
 
-      - name: Verify runner connection
+      - name: Verify runner + kubectl
         run: |
           echo "Host: $(hostname)"
-          echo "Time: $(date)"
-          uname -a
-
-      - name: Verify kubectl availability
-        run: |
-          if command -v kubectl >/dev/null 2>&1; then
-            echo "✅ kubectl present: $(kubectl version --client=true | head -n 1)"
-          else
-            echo "⚠️ installing kubectl..."
+          date
+          if ! command -v kubectl >/dev/null 2>&1; then
+            echo "Installing kubectl..."
             KVER="$(curl -sS https://dl.k8s.io/release/stable.txt)"
             curl -sSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
             chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-            kubectl version --client=true | head -n 1
           fi
+          kubectl version --client=true | head -n 1
 
-      - name: Install yq (for YAML transforms)
-        run: |
-          curl -sSL -o /tmp/yq.tar.gz https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64.tar.gz
-          tar -xzf /tmp/yq.tar.gz -C /tmp
-          sudo mv /tmp/yq_linux_amd64 /usr/local/bin/yq
-          sudo chmod +x /usr/local/bin/yq
-          yq --version
-
-      # kubeconfig from base64 (authoritative)
-      - name: Write kubeconfig
+      - name: Write kubeconfig from secret
         env:
           KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
         run: |
-          if [ -z "${KUBE_CONFIG_B64}" ]; then
-            echo "::error::Secret KUBE_CONFIG_B64 is missing"; exit 1
-          fi
-          echo "${KUBE_CONFIG_B64}" | base64 -d > "$KUBECONFIG"
-          echo "First lines of kubeconfig:" && head -n 5 "$KUBECONFIG" || true
-
-      - name: Sanity check cluster
-        run: |
+          test -n "$KUBE_CONFIG_B64" || { echo "::error::Secret KUBE_CONFIG_B64 missing"; exit 1; }
+          echo "$KUBE_CONFIG_B64" | base64 -d > "$KUBECONFIG"
+          echo "Context:"; kubectl config current-context || true
           kubectl cluster-info
           kubectl get nodes -o wide
 
@@ -72,33 +58,92 @@ jobs:
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # Make wazuh-storage an alias of a DYNAMIC provisioner (prefers rancher local-path)
-      - name: Ensure 'wazuh-storage' StorageClass (alias of dynamic provisioner)
+      # --- Sysctl: vm.max_map_count=262144 on every node (immediate + persistent) ---
+      - name: Apply sysctl DaemonSet (vm.max_map_count=262144 on all nodes)
+        run: |
+          cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: wazuh-sysctl
+            namespace: kube-system
+            labels:
+              app: wazuh-sysctl
+          spec:
+            selector:
+              matchLabels:
+                app: wazuh-sysctl
+            template:
+              metadata:
+                labels:
+                  app: wazuh-sysctl
+              spec:
+                hostPID: true
+                tolerations:
+                  - operator: "Exists"
+                containers:
+                  - name: sysctl
+                    image: busybox:1.36
+                    securityContext:
+                      privileged: true
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        echo 262144 > /host-proc/sys/vm/max_map_count
+                        mkdir -p /host-etc/sysctl.d
+                        echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
+                        echo "vm.max_map_count=$(cat /host-proc/sys/vm/max_map_count)"
+                        sleep 3
+                        exit 0
+                    volumeMounts:
+                      - name: host-proc
+                        mountPath: /host-proc
+                      - name: host-etc
+                        mountPath: /host-etc
+                restartPolicy: OnFailure
+                volumes:
+                  - name: host-proc
+                    hostPath:
+                      path: /proc
+                      type: Directory
+                  - name: host-etc
+                    hostPath:
+                      path: /etc
+                      type: Directory
+          EOF
+          kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
+
+      - name: Wait & verify sysctl DS
+        run: |
+          kubectl -n kube-system rollout status ds/wazuh-sysctl --timeout=180s || true
+          echo "---- DaemonSet pods ----"
+          kubectl -n kube-system get pods -l app=wazuh-sysctl -o wide
+          echo "---- vm.max_map_count from each pod ----"
+          for p in $(kubectl -n kube-system get pods -l app=wazuh-sysctl -o name); do
+            echo "# $p"
+            kubectl -n kube-system logs "$p" || true
+          done
+
+      - name: Cleanup sysctl DS (persistent config remains on nodes)
+        run: |
+          kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
+
+      # --- StorageClass alias 'wazuh-storage' pointing to a dynamic provisioner ---
+      - name: Ensure dynamic StorageClass alias 'wazuh-storage'
         run: |
           set -euo pipefail
-          # Prefer rancher local-path if present
           if kubectl get sc local-path >/dev/null 2>&1; then
             TARGET_SC="local-path"
           else
-            # pick a default SC that is NOT 'kubernetes.io/no-provisioner'
-            TARGET_SC=$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\t"}{.provisioner}{"\n"}{end}' \
-              | awk '$2=="true" && $3!="kubernetes.io/no-provisioner"{print $1}' | head -n1)
-            # fallback: first SC that isn’t no-provisioner
-            if [ -z "${TARGET_SC}" ]; then
-              TARGET_SC=$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.provisioner}{"\n"}{end}' \
-                | awk '$2!="kubernetes.io/no-provisioner"{print $1}' | head -n1)
-            fi
+            TARGET_SC=$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.provisioner}{"\n"}{end}' \
+              | awk '$2!="kubernetes.io/no-provisioner"{print $1; exit}')
           fi
-
-          if [ -z "${TARGET_SC:-}" ]; then
-            echo "::error::No dynamic StorageClass found (local-path or other). Install a dynamic provisioner."
-            exit 1
-          fi
-
+          test -n "${TARGET_SC:-}" || { echo "::error::No dynamic StorageClass found"; exit 1; }
           TARGET_PROV=$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')
-          echo "Using dynamic SC '${TARGET_SC}' with provisioner '${TARGET_PROV}' for wazuh-storage"
+          echo "Using SC '${TARGET_SC}' (${TARGET_PROV}) for wazuh-storage"
 
-          # If wazuh-storage exists with a different provisioner, replace it cleanly
+          # Recreate alias if needed
           if kubectl get sc wazuh-storage >/dev/null 2>&1; then
             CUR_PROV=$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}')
             if [ "$CUR_PROV" != "$TARGET_PROV" ]; then
@@ -106,8 +151,7 @@ jobs:
             fi
           fi
 
-          if ! kubectl get sc wazuh-storage >/dev/null 2>&1; then
-            cat > /tmp/wazuh-storage.yaml <<EOF
+          cat <<EOF | kubectl apply -f -
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
           metadata:
@@ -117,71 +161,77 @@ jobs:
           volumeBindingMode: WaitForFirstConsumer
           allowVolumeExpansion: true
           EOF
-            kubectl apply -f /tmp/wazuh-storage.yaml
-          fi
 
-          kubectl get storageclass -o wide
+          kubectl get sc -o wide
 
-      # Build manifests and drop any StorageClass objects to avoid immutability conflicts
-      - name: Build manifests (strip StorageClass)
-        if: ${{ hashFiles('wazuh-kubernetes/**') != '' }}
-        working-directory: ./wazuh-kubernetes
+      # --- Fetch and apply official Wazuh manifests ---
+      - name: Fetch official wazuh-kubernetes repo
         run: |
           set -euo pipefail
-          mkdir -p ../_rendered
-          # Render everything if kustomization exists, else just copy yaml files
-          if [ -f kustomization.yaml ]; then
-            kubectl kustomize . > ../_rendered/all.yaml
-          else
-            cat $(git ls-files '*.yml' '*.yaml') > ../_rendered/all.yaml
-          fi
-          # Remove any StorageClass objects in the render to avoid clashes
-          yq 'select(.kind != "StorageClass")' ../_rendered/all.yaml > ../_rendered/filtered.yaml
-          echo "Rendered to ../_rendered/filtered.yaml"
+          rm -rf wazuh-kubernetes
+          git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
+          echo "Fetched wazuh-kubernetes@$WAZUH_K8S_TAG"
+          ls -la wazuh-kubernetes
 
-      # Apply manifests: prefer rendered set; otherwise try k8s/manifests if present
-      - name: Apply manifests
+      - name: Pick overlay path (single-node or production-cluster)
+        id: pick
         run: |
           set -euo pipefail
-          if [ -f "_rendered/filtered.yaml" ]; then
-            kubectl apply -f _rendered/filtered.yaml
-          elif [ -d "k8s/manifests" ]; then
-            kubectl apply -f k8s/manifests/
-          else
-            echo "::error::No manifests found (wazuh-kubernetes/ or k8s/manifests/)"; exit 1
-          fi
+          case "$OVERLAY" in
+            single-node)        echo "overlay_path=single-node" >> "$GITHUB_OUTPUT" ;;
+            production-cluster) echo "overlay_path=production_cluster" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::Unknown overlay: $OVERLAY"; exit 1 ;;
+          esac
+          echo "Chosen overlay: $OVERLAY -> $(cat $GITHUB_OUTPUT | cut -d= -f2)"
 
-      - name: Wait for core pods (manager/indexer/dashboard)
+      - name: Inject namespace if missing (idempotent)
+        run: |
+          set -euo pipefail
+          cd wazuh-kubernetes/${{ steps.pick.outputs.overlay_path }}
+          for f in $(find . -name '*.yaml' -o -name '*.yml'); do
+            if ! grep -qE '^[[:space:]]*namespace:' "$f"; then
+              awk -v ns="$NS" '
+                BEGIN{inmeta=0}
+                /^metadata:/ {print; inmeta=1; next}
+                inmeta==1 && !printed && $0 ~ /^[[:space:]]{2}name:/ {print; print "  namespace: " ns; printed=1; next}
+                {print}
+              ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            fi
+          done
+          echo "Namespace ensured for overlay files."
+
+      - name: Apply official manifests
+        run: |
+          set -euo pipefail
+          kubectl apply -f wazuh-kubernetes/${{ steps.pick.outputs.overlay_path }}/
+          echo "Applied overlay: $OVERLAY"
+
+      - name: Wait for core components
         run: |
           set -euxo pipefail
           kubectl -n "$NS" get pods -o wide || true
-          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-manager --timeout=900s || true
-          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-indexer --timeout=900s || true
-          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-dashboard --timeout=900s || true
-          kubectl -n "$NS" get pods -o wide || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-manager --timeout=1200s || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-indexer --timeout=1200s || true
+          kubectl -n "$NS" wait --for=condition=Ready pod -l app=wazuh-dashboard --timeout=1200s || true
+          kubectl -n "$NS" get pods -o wide
 
-      # Expose dashboard on NodePort (let K8s choose the port) and print URL
-      - name: Expose dashboard on NodePort (auto-assign)
+      - name: Expose Dashboard via NodePort + print URL
         run: |
           set -euo pipefail
           SVC=$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].metadata.name}' || true)
           if [ -z "$SVC" ]; then
-            echo "::warning::Dashboard Service not found; skipping patch."
+            echo "::warning::Dashboard Service not found; skipping."
             exit 0
           fi
-
-          # Switch to NodePort and let Kubernetes allocate nodePort
+          # Force NodePort and let K8s allocate a port
           kubectl -n "$NS" patch svc "$SVC" -p '{"spec":{"type":"NodePort"}}'
-          # If a fixed nodePort was previously set, remove it to force re-allocation
           kubectl -n "$NS" patch svc "$SVC" --type='json' -p='[{"op":"remove","path":"/spec/ports/0/nodePort"}]' || true
+          PORT=$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.spec.ports[0].nodePort}')
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' | head -n1)
+          echo "🌐 Wazuh Dashboard: https://${NODE_IP}:${PORT}"
+          echo "ℹ️  Accept the self-signed certificate warning on first visit."
 
-          ASSIGNED_PORT=$(kubectl -n "$NS" get svc "$SVC" -o jsonpath='{.spec.ports[0].nodePort}')
-          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' 2>/dev/null || echo "<node-ip>")
-          echo "Assigned NodePort: ${ASSIGNED_PORT}"
-          echo "Wazuh Dashboard URL (auto): https://${NODE_IP}:${ASSIGNED_PORT}"
-          echo "Wazuh Dashboard URL (fixed): https://${NODE_IP}:${DASH_PORT} (if you later force it)"
-
-      - name: Quick status
+      - name: Final status
         run: |
-          kubectl -n "$NS" get pods -o wide || true
-          kubectl -n "$NS" get svc || true
+          kubectl -n "$NS" get svc -o wide
+          kubectl -n "$NS" get pods -o wide
