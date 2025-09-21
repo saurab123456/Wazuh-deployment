@@ -230,8 +230,8 @@ jobs:
           IN=/tmp/wazuh-all.yaml
           OUT=/tmp/wazuh-all-passwordless.yaml
 
-          # Remove volumes with names that commonly hold auth/enroll passwords
-          yq -y '
+          # Remove volumes that carry auth/enroll passwords
+          yq eval -o=y '
             ( . as $doc
               | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
               | .spec.template.spec.volumes
@@ -239,7 +239,7 @@ jobs:
           ' "$IN" > "$OUT.tmp1"
 
           # Remove volumeMounts referencing those volumes in all containers
-          yq -y '
+          yq eval -o=y '
             ( . as $doc
               | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
               | .spec.template.spec.containers
@@ -248,8 +248,8 @@ jobs:
                 ))
           ' "$OUT.tmp1" > "$OUT.tmp2"
 
-          # Optionally remove env vars pointing to password files (best effort)
-          yq -y '
+          # Best-effort: remove env vars that try to pass a password
+          yq eval -o=y '
             ( . as $doc
               | (.. | select(tag == "!!map" and has("kind") and .kind == "StatefulSet"))
               | .spec.template.spec.containers
@@ -278,17 +278,17 @@ jobs:
         shell: bash
         run: |
           set -e
-          yq -o=y e 'select(.kind != "StorageClass" and .kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sts-sc.yaml
+          yq eval -o=y 'select(.kind != "StorageClass" and .kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sts-sc.yaml
           if [ -s /tmp/wazuh-no-sts-sc.yaml ]; then kubectl -n "$NS" apply -f /tmp/wazuh-no-sts-sc.yaml; fi
 
       - name: Recreate StatefulSets to avoid immutability errors
         shell: bash
         run: |
           set -e
-          NAMES="$(yq -r 'select(.kind == "StatefulSet" and .metadata.name != null) | .metadata.name' /tmp/wazuh-all.yaml | sed 's/\r$//' | grep -E '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || true)"
+          NAMES="$(yq eval -r 'select(.kind == "StatefulSet" and .metadata.name != null) | .metadata.name' /tmp/wazuh-all.yaml | sed 's/\r$//' | grep -E '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || true)"
           if [ -n "$NAMES" ]; then
             for n in $NAMES; do kubectl -n "$NS" delete statefulset "$n" --ignore-not-found=true; done
-            yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-sts.yaml
+            yq eval -o=y 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-sts.yaml
             kubectl -n "$NS" apply -f /tmp/wazuh-sts.yaml
           fi
 
@@ -321,14 +321,8 @@ jobs:
               # Ensure <auth> exists and is passwordless
               if grep -q "<auth>" "$CONF"; then
                 sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
-                # Remove any <password>...</password> line inside <auth>
-                awk '\''
-                  BEGIN{in_auth=0}
-                  /<auth>/{in_auth=1}
-                  in_auth && /<password>.*<\/password>/{next}
-                  /<\/auth>/{in_auth=0}
-                  {print}
-                '\'' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+                # Remove any <password>...</password> inside <auth>
+                awk '\''BEGIN{in_auth=0} /<auth>/{in_auth=1} in_auth && /<password>.*<\/password>/{next} /<\/auth>/{in_auth=0} {print}'\'' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
               else
                 awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>no</use_password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
@@ -530,7 +524,7 @@ jobs:
         id: dash
         shell: bash
         run: |
-          set -euo pipefeel
+          set -euo pipefail
           PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
           if [ -z "${PORT:-}" ]; then
             PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].targetPort}' 2>/dev/null || true)"
