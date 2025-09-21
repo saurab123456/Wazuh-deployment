@@ -83,7 +83,6 @@ jobs:
               F=/var/ossec/etc/ossec.conf
               cp -f "$F" "$F.bak" || true
 
-              # turn off <use_password>, insert if missing
               if grep -q "<use_password>yes</use_password>" "$F"; then
                 sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#g" "$F"
               fi
@@ -95,7 +94,6 @@ jobs:
                 }'"'"' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
               fi
 
-              # ensure authd enabled + port
               if ! grep -q "<disabled>no</disabled>" "$F"; then
                 sed -i "/<auth>/,/<\\/auth>/ s#<disabled>.*</disabled>#<disabled>no</disabled>#g" "$F"
               fi
@@ -136,13 +134,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # IMPORTANT: unquoted heredoc + envsubst so ${IMAGE} and ${AUTHD_PORT} expand
-          cat <<EOF | envsubst '${IMAGE} ${AUTHD_PORT}' | kubectl -n "$NS" apply -f -
+          # Quote the heredoc to block shell expansion; let envsubst replace only IMAGE & AUTHD_PORT.
+          cat <<'EOF' | envsubst '${IMAGE} ${AUTHD_PORT}' | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
           kind: Service
           metadata:
-            name: wazuh     # MASTER-only service for authd + initial events
+            name: wazuh
             labels: { app: wazuh-manager, node-type: master }
           spec:
             type: ClusterIP
@@ -154,7 +152,7 @@ jobs:
           apiVersion: v1
           kind: Service
           metadata:
-            name: wazuh-workers  # WORKER-only service for agent events
+            name: wazuh-workers
             labels: { app: wazuh-manager, node-type: worker }
           spec:
             type: ClusterIP
@@ -172,14 +170,11 @@ jobs:
               <ossec_config>
                 <client>
                   <server>
-                    <!-- enroll to MASTER first -->
                     <address>wazuh.wazuh.svc.cluster.local</address>
                     <port>1514</port>
                     <protocol>tcp</protocol>
                   </server>
                 </client>
-
-                <!-- K8s logs (adjust paths if needed) -->
                 <localfile>
                   <location>/host/var/log/containers/*.log</location>
                   <log_format>syslog</log_format>
@@ -235,11 +230,9 @@ jobs:
                         set -e
                         AGENT_NAME="${NODE_NAME}"
                         echo "Agent name: $AGENT_NAME"
-
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
-
                         enroll() {
                           echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS})…"
                           if [ -n "${GROUPS}" ]; then
@@ -248,7 +241,6 @@ jobs:
                             /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}"
                           fi
                         }
-
                         if [ ! -s /var/ossec/etc/client.keys ]; then
                           for i in $(seq 1 18); do
                             if enroll; then break; fi
@@ -256,12 +248,10 @@ jobs:
                             sleep 10
                           done
                         fi
-
                         if [ ! -s /var/ossec/etc/client.keys ]; then
                           echo "ERROR: Enrollment failed; exiting."
                           exit 1
                         fi
-
                         echo "Starting Wazuh agent…"
                         /var/ossec/bin/wazuh-control start
                         sleep 5
