@@ -218,7 +218,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          OVER="${{ steps.resolve.outputs.overlay_path }}"`
+          OVER="${{ steps.resolve.outputs.overlay_path }}"
           kubectl kustomize "$OVER" > /tmp/wazuh-all.yaml
           echo "Built: /tmp/wazuh-all.yaml"
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
@@ -438,17 +438,6 @@ jobs:
                         set -e
                         AGENT_NAME="${NODE_NAME}"
                         echo "Agent name: $AGENT_NAME"
-
-                        # Preflight: ensure ClusterIP:1515 is reachable from pod network
-                        for i in $(seq 1 20); do
-                          if (getent hosts "${MANAGER_DNS}" >/dev/null 2>&1) && \
-                             (timeout 2 sh -c ":</dev/tcp/${MANAGER_DNS}/${AUTHD_PORT}" >/dev/null 2>&1); then
-                            echo "Connectivity to ${MANAGER_DNS}:${AUTHD_PORT} OK"
-                            break
-                          fi
-                          echo "Waiting for ${MANAGER_DNS}:${AUTHD_PORT}… ($i/20)"
-                          sleep 3
-                        done
 
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf 2>/dev/null || true
