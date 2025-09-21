@@ -63,8 +63,7 @@ jobs:
           yq --version
 
       - name: Write kubeconfig from secret
-        env:
-          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+        env: { KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }} }
         shell: bash
         run: |
           set -e
@@ -211,7 +210,7 @@ jobs:
           kubectl kustomize "${{ steps.resolve.outputs.overlay_path }}" > /tmp/wazuh-all.yaml
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
-      # Strip any password mounts/env (we're passwordless)
+      # Remove any password mounts/env (we're passwordless)
       - name: Remove auth password Secret mounts (passwordless)
         shell: bash
         run: |
@@ -271,10 +270,9 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # === Managers: enable AUTHD (passwordless) + safe restart + verify 1515 ===
-      - name: Enable authd (passwordless) on ALL managers
-        env:
-          MANAGER_SELECTOR: app=wazuh-manager
+      # ===== Managers: enable AUTHD passwordless (NO in-pod restart) =====
+      - name: Enable authd (passwordless) on ALL managers (no in-pod restart)
+        env: { MANAGER_SELECTOR: app=wazuh-manager }
         shell: bash
         run: |
           set -euo pipefail
@@ -286,43 +284,32 @@ jobs:
               set -e
               CONF=/var/ossec/etc/ossec.conf
               cp -f "$CONF" "${CONF}.bak.$(date +%s)" || true
-
-              # Ensure <auth> exists and is passwordless on 1515; strip any <password>...</password>
+              # Ensure <auth> exists/passwordless/1515 and strip any <password> entry
               if grep -q "<auth>" "$CONF"; then
                 sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#; s#<port>.*</port>#<port>1515</port>#; s#<disabled>.*</disabled>#<disabled>no</disabled>#" "$CONF"
                 awk '"'"'BEGIN{in_auth=0} /<auth>/{in_auth=1} in_auth && /<password>.*<\/password>/{next} /<\/auth>/{in_auth=0} {print}'"'"' "$CONF" > "$CONF.tmp" && mv "$CONF.tmp" "$CONF"
               else
                 awk "/<\/ossec_config>/{print \"  <auth>\\n    <disabled>no</disabled>\\n    <port>1515</port>\\n    <use_password>no</use_password>\\n  </auth>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
-
-              # Ensure <remote> exists for 1514/tcp events
+              # Ensure <remote> block exists for 1514/tcp events
               if grep -q "<remote>" "$CONF"; then
                 sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
               else
                 awk "/<\/ossec_config>/{print \"  <remote>\\n    <connection>secure</connection>\\n    <port>1514</port>\\n    <protocol>tcp</protocol>\\n  </remote>\"; print; next} {print}" "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
               fi
-
-              echo "Restarting Wazuh manager (safe)…"
-              for i in 1 2 3 4; do
-                if /var/ossec/bin/wazuh-control restart; then break; fi
-                echo "restart failed (attempt $i) — clearing lock and retrying"
-                rm -f /var/ossec/var/start-script-lock || true
-                sleep 3
-              done
-
-              # Final attempt to ensure it is up
-              /var/ossec/bin/wazuh-control start || true
-
-              echo "Verify authd is listening on 1515…"
-              for i in $(seq 1 30); do
-                if ss -Hntl | awk '"'"'$4 ~ /:1515$/{print; found=1} END{exit found?0:1}'"'"'; then
-                  echo "authd is listening on 1515"; break
-                fi
-                sleep 2
-              done
-              ss -Hntl | grep -E ":1515$" || { echo "authd not listening on 1515"; tail -n 100 /var/ossec/logs/ossec.log || true; exit 1; }
             '
           done
+
+      - name: Rollout restart manager StatefulSets (safe) and wait
+        shell: bash
+        run: |
+          set -e
+          for s in wazuh-manager-master wazuh-manager-worker; do
+            kubectl -n "$NS" get sts "$s" >/dev/null 2>&1 || continue
+            kubectl -n "$NS" rollout restart sts/"$s"
+            kubectl -n "$NS" rollout status sts/"$s" --timeout=600s
+          done
+          kubectl -n "$NS" get pods -l app=wazuh-manager -o wide
 
       - name: Ensure Services (master-only 1515 + workers 1514)
         shell: bash
@@ -423,38 +410,37 @@ jobs:
                       - name: GROUPS
                         value: "kubernetes"
                     command: ["/bin/sh","-c"]
-                    args:
-                      - |
-                        set -e
-                        AGENT_NAME="${NODE_NAME}"
-                        echo "Agent name: $AGENT_NAME"
-                        mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
-                        cp /config/ossec.conf /var/ossec/etc/ossec.conf 2>/dev/null || true
-                        rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
-                        enroll() {
-                          echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS})…"
-                          if [ -n "${GROUPS}" ]; then
-                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}"
-                          else
-                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}"
-                          fi
-                        }
-                        if [ ! -s /var/ossec/etc/client.keys ]; then
-                          for i in $(seq 1 36); do
-                            if enroll; then break; fi
-                            echo "Enroll attempt $i failed; retrying in 5s…"
-                            sleep 5
-                          done
+                    args: |
+                      set -e
+                      AGENT_NAME="${NODE_NAME}"
+                      echo "Agent name: $AGENT_NAME"
+                      mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
+                      cp /config/ossec.conf /var/ossec/etc/ossec.conf 2>/dev/null || true
+                      rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+                      enroll() {
+                        echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS})…"
+                        if [ -n "${GROUPS}" ]; then
+                          /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}"
+                        else
+                          /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}"
                         fi
-                        if [ ! -s /var/ossec/etc/client.keys ]; then
-                          echo "ERROR: Enrollment failed; exiting."
-                          exit 1
-                        fi
-                        echo "Starting Wazuh agent…"
-                        /var/ossec/bin/wazuh-control start
-                        sleep 5
-                        /var/ossec/bin/wazuh-control status
-                        tail -f /var/ossec/logs/ossec.log
+                      }
+                      if [ ! -s /var/ossec/etc/client.keys ]; then
+                        for i in $(seq 1 36); do
+                          if enroll; then break; fi
+                          echo "Enroll attempt $i failed; retrying in 5s…"
+                          sleep 5
+                        done
+                      fi
+                      if [ ! -s /var/ossec/etc/client.keys ]; then
+                        echo "ERROR: Enrollment failed; exiting."
+                        exit 1
+                      fi
+                      echo "Starting Wazuh agent…"
+                      /var/ossec/bin/wazuh-control start
+                      sleep 5
+                      /var/ossec/bin/wazuh-control status
+                      tail -f /var/ossec/logs/ossec.log
                     readinessProbe:
                       exec: { command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"'] }
                       initialDelaySeconds: 30
