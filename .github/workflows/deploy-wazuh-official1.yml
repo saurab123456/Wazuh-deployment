@@ -19,11 +19,15 @@ on:
         description: "Local port for port-forward"
         required: true
         default: "8444"
+      enable_port_forward:
+        description: "Start port-forward automatically (true/false)"
+        required: true
+        default: "true"
 
 jobs:
   deploy:
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
-    timeout-minutes: 60
+    timeout-minutes: 180
 
     env:
       NS: wazuh
@@ -79,25 +83,18 @@ jobs:
           metadata:
             name: wazuh-sysctl
             namespace: kube-system
-            labels:
-              app: wazuh-sysctl
+            labels: { app: wazuh-sysctl }
           spec:
-            selector:
-              matchLabels:
-                app: wazuh-sysctl
+            selector: { matchLabels: { app: wazuh-sysctl } }
             template:
-              metadata:
-                labels:
-                  app: wazuh-sysctl
+              metadata: { labels: { app: wazuh-sysctl } }
               spec:
                 hostPID: true
-                tolerations:
-                  - operator: "Exists"
+                tolerations: [ { operator: "Exists" } ]
                 containers:
                   - name: sysctl
                     image: busybox:1.36
-                    securityContext:
-                      privileged: true
+                    securityContext: { privileged: true }
                     command: ["/bin/sh","-c"]
                     args:
                       - |
@@ -108,19 +105,11 @@ jobs:
                         echo "now: $(cat /host-proc/sys/vm/max_map_count)"
                         sleep 60
                     volumeMounts:
-                      - name: host-proc
-                        mountPath: /host-proc
-                      - name: host-etc
-                        mountPath: /host-etc
+                      - { name: host-proc, mountPath: /host-proc }
+                      - { name: host-etc,  mountPath: /host-etc  }
                 volumes:
-                  - name: host-proc
-                    hostPath:
-                      path: /proc
-                      type: Directory
-                  - name: host-etc
-                    hostPath:
-                      path: /etc
-                      type: Directory
+                  - { name: host-proc, hostPath: { path: /proc, type: Directory } }
+                  - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
           kubectl -n kube-system rollout status ds/wazuh-sysctl --timeout=180s || true
@@ -144,8 +133,7 @@ jobs:
           cat <<EOF | kubectl apply -f -
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
-          metadata:
-            name: wazuh-storage
+          metadata: { name: wazuh-storage }
           provisioner: ${TARGET_PROV}
           reclaimPolicy: Delete
           volumeBindingMode: WaitForFirstConsumer
@@ -170,7 +158,7 @@ jobs:
           while IFS= read -r d; do
             low="$(echo "$d" | tr '[:upper:]' '[:lower:]')"
             if [ "$WANT" = "single" ] && echo "$low" | grep -q single; then PICK="$d"; break; fi
-            if [ "$WANT" = "production" ] && echo "$low" | grep -q prod; then PICK="$d"; break; fi
+            if [ "$WANT" = "production" ] && echo "$low" | grep -q prod;  then PICK="$d"; break; fi
           done <<< "$CANDS"
           if [ -z "$PICK" ]; then PICK="$(echo "$CANDS" | head -n1)"; fi
           echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
@@ -208,7 +196,6 @@ jobs:
           IP.1  = 127.0.0.1
           CONF
 
-          # Root CA for indexer cluster
           openssl genrsa -out "$IC/root-ca-key.pem" 4096
           openssl req -x509 -new -key "$IC/root-ca-key.pem" -sha256 -days 3650 -subj "/CN=Wazuh Root CA" -out "$IC/root-ca.pem"
 
@@ -221,7 +208,6 @@ jobs:
           }
           for n in admin dashboard node filebeat; do sign_ic "$n"; done
 
-          # Dashboard HTTPS cert pair
           openssl genrsa -out "$DH/key.pem" 2048
           openssl req -new -key "$DH/key.pem" -out "$DH/dashboard.csr" -config /tmp/wazuh-openssl.cnf
           openssl x509 -req -in "$DH/dashboard.csr" -CA "$IC/root-ca.pem" -CAkey "$IC/root-ca-key.pem" -CAcreateserial -out "$DH/cert.pem" -days 825 -sha256 -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
@@ -284,7 +270,6 @@ jobs:
             if ! kubectl -n "$NS" wait --for=condition=Ready pod -l "$sel" --timeout=1800s; then
               echo "::warning::Timeout waiting for $sel; dumping diagnostics"
               kubectl -n "$NS" get pods -l "$sel" -o wide || true
-              # Describe and tail logs for up to 2 pods of this selector
               P="$(kubectl -n "$NS" get pods -l "$sel" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | head -n2)"
               for pod in $P; do
                 echo "---- describe $pod ----"
@@ -296,6 +281,74 @@ jobs:
           done
           kubectl -n "$NS" get pods -o wide
       # ---------- END WAIT ----------
+
+      # ---------- PASSWORDLESS AUTHD + AGENT CONFIG ----------
+      - name: Enable passwordless authd on ALL managers
+        env:
+          MANAGER_SELECTOR: app=wazuh-manager
+        run: |
+          set -euo pipefail
+          PODS=$(kubectl -n "$NS" get pods -l "$MANAGER_SELECTOR" -o name)
+          test -n "$PODS" || { echo "No manager pods found"; exit 1; }
+          for POD in $PODS; do
+            echo ">> Patching $POD"
+            kubectl -n "$NS" exec "$POD" -- sh -lc '
+              set -e
+              CONF=/var/ossec/etc/ossec.conf
+              cp -f "$CONF" "${CONF}.bak.$(date +%s)"
+
+              if grep -q "<auth>" "$CONF"; then
+                if grep -q "<use_password>" "$CONF"; then
+                  sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#" "$CONF"
+                else
+                  awk '"'"'/<auth>/{print;ins=1;next} ins && /<\/auth>/{print "    <use_password>no</use_password>"; print; ins=0; next} {print}'"'"' "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
+                fi
+                grep -q "<ssl_verify_host>" "$CONF" || sed -i "s#</auth>#  <ssl_verify_host>no</ssl_verify_host>\n</auth>#g" "$CONF"
+                grep -q "<ssl_auto_negotiate>" "$CONF" || sed -i "s#</auth>#  <ssl_auto_negotiate>yes</ssl_auto_negotiate>\n</auth>#g" "$CONF"
+              else
+                awk '"'"'/<\/ossec_config>/{print "  <auth>\n    <disabled>no</disabled>\n    <port>1515</port>\n    <use_source_ip>no</use_source_ip>\n    <purge>no</purge>\n    <use_password>no</use_password>\n    <ssl_verify_host>no</ssl_verify_host>\n    <ssl_auto_negotiate>yes</ssl_auto_negotiate>\n  </auth>"; print; next} {print}'"'"' "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
+              fi
+
+              if grep -q "<remote>" "$CONF"; then
+                sed -i "s#<connection>.*</connection>#<connection>secure</connection>#; s#<protocol>.*</protocol>#<protocol>tcp</protocol>#; s#<port>.*</port>#<port>1514</port>#" "$CONF"
+                grep -q "<connection>secure</connection>" "$CONF" || sed -i "s#</remote>#  <connection>secure</connection>\n</remote>#g" "$CONF"
+                grep -q "<protocol>tcp</protocol>" "$CONF"      || sed -i "s#</remote>#  <protocol>tcp</protocol>\n</remote>#g" "$CONF"
+                grep -q "<port>1514</port>" "$CONF"             || sed -i "s#</remote>#  <port>1514</port>\n</remote>#g" "$CONF"
+              else
+                awk '"'"'/<\/ossec_config>/{print "  <remote>\n    <connection>secure</connection>\n    <port>1514</port>\n    <protocol>tcp</protocol>\n  </remote>"; print; next} {print}'"'"' "$CONF" > "$CONF.new" && mv "$CONF.new" "$CONF"
+              fi
+
+              /var/ossec/bin/wazuh-control restart || true
+            '
+          done
+
+      - name: Ensure Agent ConfigMap (passwordless + correct services) and restart agents
+        run: |
+          set -euo pipefail
+          cat > /tmp/agent-ossec.conf <<'EOF'
+          <ossec_config>
+            <client>
+              <server>
+                <address>wazuh-workers.wazuh.svc.cluster.local</address>
+                <port>1514</port>
+                <protocol>tcp</protocol>
+              </server>
+              <enrollment>
+                <enabled>yes</enabled>
+                <manager_address>wazuh.wazuh.svc.cluster.local</manager_address>
+                <port>1515</port>
+                <use_password>no</use_password>
+                <ssl_verify_host>no</ssl_verify_host>
+                <auto_negotiate>no</auto_negotiate>
+              </enrollment>
+            </client>
+          </ossec_config>
+          EOF
+          kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
+          kubectl -n "$NS" rollout restart ds/wazuh-agent
+          kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || echo "::warning::Agent DS not fully ready yet"
+          kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
+      # ---------- END PASSWORDLESS/AUTH ----------
 
       - name: Expose Dashboard via fixed NodePort
         run: |
@@ -329,11 +382,27 @@ jobs:
           STATUS="$(curl -kIs --connect-timeout 10 "https://${NODE_IP}:30443" | head -n1 || true)"
           echo "Status line from dashboard: ${STATUS:-<no response>}"
 
-      - name: Port-forward one-liner (for local testing)
+      - name: Start Dashboard port-forward (auto)
+        if: ${{ inputs.enable_port_forward == 'true' }}
+        env:
+          PF_BIND: 127.0.0.1   # change to 0.0.0.0 if you want runner-IP access
+          PF_PORT: ${{ inputs.local_forward_port }}
         run: |
-          echo "If you prefer localhost testing:"
-          echo "  kubectl -n ${NS} port-forward svc/wazuh-dashboard-nodeport ${LOCAL_FORWARD_PORT}:443"
-          echo "Open: https://localhost:${LOCAL_FORWARD_PORT} (accept the self-signed cert)"
+          set -euo pipefail
+          echo "Starting: kubectl -n ${NS} port-forward --address ${PF_BIND} svc/dashboard ${PF_PORT}:443"
+          nohup kubectl -n "${NS}" port-forward --address "${PF_BIND}" svc/dashboard "${PF_PORT}:443" > portforward.log 2>&1 &
+          PF_PID=$!
+          echo "PF PID: ${PF_PID}"
+          for i in $(seq 1 30); do
+            sleep 2
+            if curl -kIs --connect-timeout 2 "https://localhost:${PF_PORT}" >/dev/null 2>&1; then
+              break
+            fi
+          done
+          echo "::notice title=Browse Now::Open https://localhost.com:${PF_PORT} (or https://localhost:${PF_PORT}) and accept the self-signed certificate."
+          echo "If you are not on the runner host, SSH tunnel to it:"
+          echo "  ssh -L ${PF_PORT}:localhost:${PF_PORT} <runner-user>@<runner-ip>"
+          timeout 45m tail -f portforward.log || true
 
       - name: Final status
         run: |
