@@ -311,6 +311,31 @@ jobs:
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
 
+      - name: Expose Wazuh Dashboard on 30443 (NodePort)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Create/update a NodePort Service bound to port 30443 -> targetPort 5601
+          cat <<'EOF' | kubectl -n "$NS" apply -f -
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: wazuh-dashboard-nodeport
+            labels:
+              app: wazuh-dashboard
+          spec:
+            type: NodePort
+            selector:
+              app: wazuh-dashboard
+            ports:
+              - name: https
+                port: 443
+                targetPort: 5601
+                nodePort: 30443
+                protocol: TCP
+          EOF
+          echo "Dashboard should be reachable at: https://<NODE-IP>:30443 (self-signed cert likely)."
+
       - name: Verify enrollment on master
         shell: bash
         run: |
@@ -344,7 +369,7 @@ jobs:
           kubectl -n "$NS" get pods -o wide || true
           echo
           echo "---- Services"
-          kubectl -n "$NS" get svc wazuh wazuh-workers -o wide || true
+          kubectl -n "$NS" get svc wazuh wazuh-workers wazuh-dashboard-nodeport -o wide || true
           echo
           echo "---- Manager logs (ports)"
           kubectl -n "$NS" logs "$MASTER_POD" --tail=300 | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" | tail -n 80 || true
