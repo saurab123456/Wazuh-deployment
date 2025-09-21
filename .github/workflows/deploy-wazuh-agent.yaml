@@ -23,7 +23,7 @@ jobs:
       NS: wazuh
       IMAGE: ghcr.io/saurab123456/wazuh-agent:4.12.0
       AUTHD_PORT: "1515"   # manager authd (enrollment)
-      EVENTS_PORT: "1514"  # remoted/events
+      EVENTS_PORT: "1514"  # remoted/events (kept for clarity)
 
     steps:
       - name: Checkout
@@ -68,21 +68,36 @@ jobs:
           kubectl -n "$NS" wait --for=condition=Ready "pod/$MPOD" --timeout=180s || true
           [ -n "$WPOD" ] && kubectl -n "$NS" wait --for=condition=Ready "pod/$WPOD" --timeout=180s || true
 
-      - name: Force BOTH managers to passwordless and restart
+      - name: Patch manager config (passwordless authd 1515 + debug dump)
         shell: bash
         run: |
           set -euo pipefail
           . "$GITHUB_ENV" || true
 
-          pwless () {
+          patch_conf () {
             local POD="$1"
             [ -z "$POD" ] && return 0
-            echo "Setting <use_password>no</use_password> on $POD"
+            echo "=== BEFORE ($POD) auth section ==="
+            kubectl -n "$NS" exec "$POD" -- sh -lc 'F=/var/ossec/etc/ossec.conf; [ -f "$F" ] && sed -n "/<auth>/,/<\\/auth>/p" "$F" || echo "No $F"'
+
+            echo "Patching ossec.conf inside $POD"
             kubectl -n "$NS" exec "$POD" -- sh -lc '
               set -e
               F=/var/ossec/etc/ossec.conf
+              [ -f "$F" ] || { echo "No $F in pod"; exit 1; }
               cp -f "$F" "$F.bak" || true
 
+              # ensure <auth> enabled
+              if ! grep -q "<disabled>no</disabled>" "$F"; then
+                sed -i "/<auth>/,/<\\/auth>/ s#<disabled>.*</disabled>#<disabled>no</disabled>#g" "$F"
+              fi
+
+              # ensure port 1515
+              if ! grep -q "<port>1515</port>" "$F"; then
+                sed -i "/<auth>/,/<\\/auth>/ s#<port>.*</port>#<port>1515</port>#g" "$F"
+              fi
+
+              # disable password usage
               if grep -q "<use_password>yes</use_password>" "$F"; then
                 sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#g" "$F"
               fi
@@ -94,21 +109,19 @@ jobs:
                 }'"'"' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
               fi
 
-              if ! grep -q "<disabled>no</disabled>" "$F"; then
-                sed -i "/<auth>/,/<\\/auth>/ s#<disabled>.*</disabled>#<disabled>no</disabled>#g" "$F"
-              fi
-              if ! grep -q "<port>1515</port>" "$F"; then
-                sed -i "/<auth>/,/<\\/auth>/ s#<port>.*</port>#<port>1515</port>#g" "$F"
-              fi
-
+              echo "Restarting wazuh-manager (in-pod)…"
               /var/ossec/bin/wazuh-control restart || true
             '
-            echo "Recreating pod $POD to ensure clean start…"
+
+            echo "=== AFTER ($POD) auth section ==="
+            kubectl -n "$NS" exec "$POD" -- sh -lc 'sed -n "/<auth>/,/<\\/auth>/p" /var/ossec/etc/ossec.conf || true'
+
+            echo "Recreating pod $POD for clean start…"
             kubectl -n "$NS" delete pod "$POD" --wait=true
           }
 
-          pwless "${MASTER_POD:-}"
-          pwless "${WORKER_POD:-}"
+          patch_conf "${MASTER_POD:-}"
+          patch_conf "${WORKER_POD:-}"
 
           kubectl -n "$NS" rollout status sts/wazuh-manager-master --timeout=300s || true
           kubectl -n "$NS" rollout status sts/wazuh-manager-worker --timeout=300s || true
@@ -134,13 +147,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Quote the heredoc to block shell expansion; let envsubst replace only IMAGE & AUTHD_PORT.
+          # Quote heredoc so shell doesn't expand ${NODE_NAME}, etc.; envsubst only fills IMAGE & AUTHD_PORT
           cat <<'EOF' | envsubst '${IMAGE} ${AUTHD_PORT}' | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
           kind: Service
           metadata:
-            name: wazuh
+            name: wazuh     # MASTER-only service for authd + initial events
             labels: { app: wazuh-manager, node-type: master }
           spec:
             type: ClusterIP
@@ -152,7 +165,7 @@ jobs:
           apiVersion: v1
           kind: Service
           metadata:
-            name: wazuh-workers
+            name: wazuh-workers  # WORKER-only service for agent events
             labels: { app: wazuh-manager, node-type: worker }
           spec:
             type: ClusterIP
@@ -170,11 +183,14 @@ jobs:
               <ossec_config>
                 <client>
                   <server>
+                    <!-- enroll to MASTER first -->
                     <address>wazuh.wazuh.svc.cluster.local</address>
                     <port>1514</port>
                     <protocol>tcp</protocol>
                   </server>
                 </client>
+
+                <!-- K8s logs (adjust paths if needed) -->
                 <localfile>
                   <location>/host/var/log/containers/*.log</location>
                   <log_format>syslog</log_format>
@@ -230,9 +246,11 @@ jobs:
                         set -e
                         AGENT_NAME="${NODE_NAME}"
                         echo "Agent name: $AGENT_NAME"
+
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+
                         enroll() {
                           echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS})…"
                           if [ -n "${GROUPS}" ]; then
@@ -241,6 +259,7 @@ jobs:
                             /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}"
                           fi
                         }
+
                         if [ ! -s /var/ossec/etc/client.keys ]; then
                           for i in $(seq 1 18); do
                             if enroll; then break; fi
@@ -248,10 +267,12 @@ jobs:
                             sleep 10
                           done
                         fi
+
                         if [ ! -s /var/ossec/etc/client.keys ]; then
                           echo "ERROR: Enrollment failed; exiting."
                           exit 1
                         fi
+
                         echo "Starting Wazuh agent…"
                         /var/ossec/bin/wazuh-control start
                         sleep 5
