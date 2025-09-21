@@ -4,13 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       overlay:
-        description: "Which official overlay to apply"
+        description: "Overlay to deploy"
         required: true
-        default: single-node
+        default: single
         type: choice
         options:
-          - single-node
-          - production-cluster
+          - single
+          - production
       wazuh_tag:
         description: "wazuh-kubernetes repo tag (e.g., v4.12.0)"
         required: true
@@ -20,7 +20,6 @@ jobs:
   deploy:
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
     timeout-minutes: 45
-
     env:
       NS: wazuh
       KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
@@ -31,9 +30,8 @@ jobs:
       - name: Checkout (this repo)
         uses: actions/checkout@v4
 
-      - name: Verify runner + kubectl
+      - name: Ensure kubectl
         run: |
-          echo "Host: $(hostname)"; date
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER="$(curl -sS https://dl.k8s.io/release/stable.txt)"
             curl -sSLo kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"
@@ -54,7 +52,7 @@ jobs:
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      # ------------ sysctl: vm.max_map_count ------------
+      # ---------------- SYSCTL: vm.max_map_count ----------------
       - name: Apply sysctl DaemonSet (vm.max_map_count=262144 on all nodes)
         run: |
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
@@ -86,18 +84,18 @@ jobs:
                         mkdir -p /host-etc/sysctl.d
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
                         echo "vm.max_map_count now: $(cat /host-proc/sys/vm/max_map_count)"
+                        # keep alive briefly for log inspection
                         sleep 120
                     volumeMounts:
                       - { name: host-proc, mountPath: /host-proc }
                       - { name: host-etc,  mountPath: /host-etc  }
-                restartPolicy: Always
                 volumes:
                   - { name: host-proc, hostPath: { path: /proc, type: Directory } }
                   - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
 
-      - name: Wait & verify sysctl DS
+      - name: Verify sysctl DS
         run: |
           kubectl -n kube-system rollout status ds/wazuh-sysctl --timeout=180s || true
           kubectl -n kube-system get pods -l app=wazuh-sysctl -o wide
@@ -106,10 +104,10 @@ jobs:
             kubectl -n kube-system logs "$p" || true
           done
 
-      - name: Cleanup sysctl DS (keeps /etc/sysctl.d/99-wazuh.conf on nodes)
+      - name: Cleanup sysctl DS (persistent config remains on nodes)
         run: |
           kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
-      # ------------ end sysctl ------------
+      # ---------------- END SYSCTL ----------------
 
       - name: Ensure dynamic StorageClass alias 'wazuh-storage'
         run: |
@@ -151,47 +149,52 @@ jobs:
           echo "Fetched wazuh-kubernetes@$WAZUH_K8S_TAG"
           ls -la wazuh-kubernetes
 
+      # --------- AUTO-DISCOVER OVERLAY PATH (robust) ----------
       - name: Resolve overlay path (auto-detect layout)
         id: resolve
+        shell: bash
         run: |
           set -euo pipefail
-          case "$OVERLAY_CHOICE" in
-            single-node)        want1="single-node"; want2="single_node";;
-            production-cluster) want1="production_cluster"; want2="production-cluster";;
-            *) echo "::error::Unknown overlay choice: $OVERLAY_CHOICE"; exit 1;;
-          esac
-
-          candidates=(
-            "wazuh-kubernetes/${want1}"
-            "wazuh-kubernetes/${want2}"
-            "wazuh-kubernetes/wazuh/${want1}"
-            "wazuh-kubernetes/wazuh/${want2}"
-            "wazuh-kubernetes/kubernetes/${want1}"
-            "wazuh-kubernetes/kubernetes/${want2}"
+          want_keyword="${OVERLAY_CHOICE}"        # "single" or "production"
+          # 1) Collect all dirs that contain Wazuh k8s manifests (dashboard/manager/indexer)
+          mapfile -t candidate_dirs < <(
+            grep -RIl --include='*.yml' --include='*.yaml' -e 'wazuh-dashboard\|wazuh-manager\|wazuh-indexer' wazuh-kubernetes 2>/dev/null \
+              | xargs -r -n1 dirname \
+              | sort -u
           )
 
-          found=""
-          for p in "${candidates[@]}"; do
-            if [ -d "$p" ]; then found="$p"; break; fi
-          done
-
-          if [ -z "$found" ]; then
-            echo "::error::Could not find overlay directory. Tried:"
-            printf ' - %s\n' "${candidates[@]}"
-            echo "Repo tree:"; ls -laR wazuh-kubernetes | sed -n '1,200p'
+          if [ ${#candidate_dirs[@]} -eq 0 ]; then
+            echo "::error::Could not find any Wazuh Kubernetes manifests in this tag."
+            ls -laR wazuh-kubernetes | sed -n '1,200p'
             exit 1
           fi
 
-          echo "overlay_path=$found" >> "$GITHUB_OUTPUT"
-          echo "Resolved overlay path: $found"
+          # 2) Prefer a directory whose path name hints the chosen overlay
+          chosen=""
+          for d in "${candidate_dirs[@]}"; do
+            base="$(echo "$d" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$want_keyword" == "single" && "$base" =~ single ]]; then chosen="$d"; break; fi
+            if [[ "$want_keyword" == "production" && "$base" =~ prod ]]; then chosen="$d"; break; fi
+          done
+
+          # 3) Fallback: first candidate
+          if [ -z "$chosen" ]; then
+            chosen="${candidate_dirs[0]}"
+          fi
+
+          echo "overlay_path=$chosen" >> "$GITHUB_OUTPUT"
+          echo "Resolved overlay path: $chosen"
+          # Show a sample of what will be applied
+          ls -la "$chosen" | sed -n '1,120p'
 
       - name: Inject namespace if missing (idempotent)
+        shell: bash
         run: |
           set -euo pipefail
           cd "${{ steps.resolve.outputs.overlay_path }}"
-          # add namespace under metadata if not present in a file
           for f in $(find . -type f \( -name '*.yaml' -o -name '*.yml' \)); do
-            if ! grep -qE '^[[:space:]]*namespace:' "$f"; then
+            # only inject if there's a metadata block and no namespace already
+            if grep -qE '^kind:' "$f" && grep -qE '^metadata:' "$f" && ! grep -qE '^[[:space:]]*namespace:' "$f"; then
               awk -v ns="$NS" '
                 BEGIN{inmeta=0}
                 /^metadata:[[:space:]]*$/ {print; inmeta=1; next}
@@ -200,6 +203,7 @@ jobs:
               ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
             fi
           done
+          echo "Namespace ensured for files in: $PWD"
 
       - name: Apply official manifests
         run: |
