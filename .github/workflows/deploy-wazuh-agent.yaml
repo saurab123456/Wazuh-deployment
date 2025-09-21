@@ -83,7 +83,6 @@ jobs:
               FILE=/var/ossec/etc/ossec.conf
               cp -f "$FILE" "$FILE.bak" || true
 
-              # If tag exists and is yes -> make it no; if missing -> insert it inside <auth>
               if grep -q "<use_password>yes</use_password>" "$FILE"; then
                 sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#g" "$FILE"
               elif ! grep -q "<use_password>no</use_password>" "$FILE"; then
@@ -93,18 +92,16 @@ jobs:
                 /<auth>/ && !ins { print "    <use_password>no</use_password>"; ins=1 }'"'"' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
               fi
             '
-            echo "Deleting $POD to apply config (StatefulSet will recreate)…"
+            echo "Deleting $POD to apply config…"
             kubectl -n "$NS" delete pod "$POD"
           }
 
           force_pwless_and_restart "${MASTER_POD:-}"
           force_pwless_and_restart "${WORKER_POD:-}"
 
-          # Wait for StatefulSets to reconcile (names match pod prefixes)
           kubectl -n "$NS" rollout status sts/wazuh-manager-master --timeout=300s || true
           kubectl -n "$NS" rollout status sts/wazuh-manager-worker --timeout=300s || true
 
-          # Capture new pod names
           NEWM="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=master -o jsonpath="{.items[0].metadata.name}" || true)"
           echo "MASTER_POD=$NEWM" >> "$GITHUB_ENV"
           NEWW="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath="{.items[0].metadata.name}" || true)"
@@ -126,6 +123,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Unquoted heredoc so ${IMAGE} etc expand on the runner.
+          # All variables meant for the CONTAINER are escaped as \${…}.
           cat <<EOF | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
@@ -161,14 +160,11 @@ jobs:
               <ossec_config>
                 <client>
                   <server>
-                    <!-- Agents send events to master first (flip to workers later) -->
                     <address>wazuh.wazuh.svc.cluster.local</address>
                     <port>1514</port>
                     <protocol>tcp</protocol>
                   </server>
                 </client>
-
-                <!-- Some useful log sources on the node -->
                 <localfile>
                   <location>/host/var/log/containers/*.log</location>
                   <log_format>syslog</log_format>
@@ -215,36 +211,35 @@ jobs:
                       - name: AUTHD_PORT
                         value: "${AUTHD_PORT}"
                       - name: MANAGER_DNS
-                        value: "wazuh.wazuh.svc.cluster.local"   # enroll to MASTER (authd 1515)
+                        value: "wazuh.wazuh.svc.cluster.local"
                       - name: GROUPS
                         value: "kubernetes"
                     command: ["/bin/sh","-c"]
                     args:
                       - |
                         set -e
-                        AGENT_NAME="${NODE_NAME}"
-                        echo "Agent name: $AGENT_NAME"
+                        AGENT_NAME="\${NODE_NAME}"
+                        echo "Agent name: \${AGENT_NAME}"
 
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
 
                         enroll() {
-                          echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS})…"
-                          if [ -n "${GROUPS}" ]; then
-                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}"
+                          echo "Enrolling to \${MANAGER_DNS}:\${AUTHD_PORT} (group=\${GROUPS})…"
+                          if [ -n "\${GROUPS}" ]; then
+                            /var/ossec/bin/agent-auth -m "\${MANAGER_DNS}" -p "\${AUTHD_PORT}" -A "\${AGENT_NAME}" -G "\${GROUPS}"
                           else
-                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}"
+                            /var/ossec/bin/agent-auth -m "\${MANAGER_DNS}" -p "\${AUTHD_PORT}" -A "\${AGENT_NAME}"
                           fi
                         }
 
-                        # Retry enrollment up to 18 times (~3 minutes)
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          for i in $(seq 1 18); do
+                          for i in \$(seq 1 18); do
                             if enroll; then
                               break
                             fi
-                            echo "Enroll attempt $i failed; retrying in 10s…"
+                            echo "Enroll attempt \$i failed; retrying in 10s…"
                             sleep 10
                           done
                         fi
