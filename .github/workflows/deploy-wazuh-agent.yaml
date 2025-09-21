@@ -83,12 +83,10 @@ jobs:
               F=/var/ossec/etc/ossec.conf
               cp -f "$F" "$F.bak" || true
 
-              # If <use_password>yes</use_password> exists, turn it off.
+              # turn off <use_password>, insert if missing
               if grep -q "<use_password>yes</use_password>" "$F"; then
                 sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#g" "$F"
               fi
-
-              # If <use_password> is missing, insert it inside <auth>…</auth>.
               if ! grep -q "<use_password>no</use_password>" "$F"; then
                 awk '"'"'{
                   print
@@ -97,7 +95,7 @@ jobs:
                 }'"'"' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
               fi
 
-              # Make sure authd is enabled and ports are set.
+              # ensure authd enabled + port
               if ! grep -q "<disabled>no</disabled>" "$F"; then
                 sed -i "/<auth>/,/<\\/auth>/ s#<disabled>.*</disabled>#<disabled>no</disabled>#g" "$F"
               fi
@@ -105,10 +103,8 @@ jobs:
                 sed -i "/<auth>/,/<\\/auth>/ s#<port>.*</port>#<port>1515</port>#g" "$F"
               fi
 
-              echo "Restarting manager inside container…"
               /var/ossec/bin/wazuh-control restart || true
             '
-
             echo "Recreating pod $POD to ensure clean start…"
             kubectl -n "$NS" delete pod "$POD" --wait=true
           }
@@ -140,7 +136,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat <<'EOF' | kubectl -n "$NS" apply -f -
+          # IMPORTANT: unquoted heredoc + envsubst so ${IMAGE} and ${AUTHD_PORT} expand
+          cat <<EOF | envsubst '${IMAGE} ${AUTHD_PORT}' | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
           kind: Service
