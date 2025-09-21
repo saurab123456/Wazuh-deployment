@@ -91,14 +91,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Print last log lines; Wazuh defaults are authd:1515 and remoted:1514
           kubectl -n "$NS" logs "$MASTER_POD" --tail=400 || true
 
       - name: Apply Services, ConfigMap, and DaemonSet (send events to MASTER first)
         shell: bash
         run: |
           set -euo pipefail
-          # NOTE: unquoted heredoc so ${IMAGE} etc. expand
+          # NOTE: unquoted heredoc so ${IMAGE}, ${AUTHD_PORT} expand on runner.
+          #       Vars meant for the container are escaped as \${...} / \$...
           cat <<EOF | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
@@ -194,29 +194,29 @@ jobs:
                     args:
                       - |
                         set -e
-                        AGENT_NAME="$NODE_NAME"
-                        echo "Agent name: $AGENT_NAME"
+                        AGENT_NAME="\${NODE_NAME}"
+                        echo "Agent name: \$AGENT_NAME"
 
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
 
                         enroll() {
-                          echo "Enrolling to $MANAGER_DNS:$AUTHD_PORT (group=$GROUPS)…"
-                          if [ -n "$GROUPS" ]; then
-                            /var/ossec/bin/agent-auth -m "$MANAGER_DNS" -p "$AUTHD_PORT" -A "$AGENT_NAME" -G "$GROUPS"
+                          echo "Enrolling to \${MANAGER_DNS}:\${AUTHD_PORT} (group=\${GROUPS})…"
+                          if [ -n "\${GROUPS}" ]; then
+                            /var/ossec/bin/agent-auth -m "\${MANAGER_DNS}" -p "\${AUTHD_PORT}" -A "\${AGENT_NAME}" -G "\${GROUPS}"
                           else
-                            /var/ossec/bin/agent-auth -m "$MANAGER_DNS" -p "$AUTHD_PORT" -A "$AGENT_NAME"
+                            /var/ossec/bin/agent-auth -m "\${MANAGER_DNS}" -p "\${AUTHD_PORT}" -A "\${AGENT_NAME}"
                           fi
                         }
 
                         # Retry enrollment up to 12 times (~2 minutes)
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          for i in $(seq 1 12); do
+                          for i in \$(seq 1 12); do
                             if enroll; then
                               break
                             fi
-                            echo "Enroll attempt $i failed; retrying in 10s…"
+                            echo "Enroll attempt \$i failed; retrying in 10s…"
                             sleep 10
                           done
                         fi
