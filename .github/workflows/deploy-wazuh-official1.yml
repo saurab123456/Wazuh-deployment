@@ -62,6 +62,7 @@ jobs:
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
+      # ---------- SYSCTL: vm.max_map_count ----------
       - name: Set vm.max_map_count on nodes (DaemonSet)
         run: |
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
@@ -116,6 +117,7 @@ jobs:
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
           kubectl -n kube-system rollout status ds/wazuh-sysctl --timeout=180s || true
           kubectl -n kube-system delete ds/wazuh-sysctl --ignore-not-found=true
+      # ---------- END SYSCTL ----------
 
       - name: Ensure StorageClass alias 'wazuh-storage'
         run: |
@@ -176,23 +178,48 @@ jobs:
             fi
           fi
 
-      - name: Apply overlay (first pass)
+      - name: Apply overlay (skip StorageClass & StatefulSet)
         run: |
           set -e
           cd "${{ steps.resolve.outputs.overlay_path }}"
-          kubectl apply -f .
+          FILES="$(find . -type f \( -name '*.yaml' -o -name '*.yml' \))"
+          APPLY_LIST=""
+          for f in $FILES; do
+            if grep -qE '^[[:space:]]*kind:[[:space:]]*StorageClass' "$f"; then
+              echo "Skip StorageClass manifest: $f"
+              continue
+            fi
+            if grep -qE '^[[:space:]]*kind:[[:space:]]*StatefulSet' "$f"; then
+              echo "Defer StatefulSet manifest: $f"
+              continue
+            fi
+            APPLY_LIST="$APPLY_LIST $f"
+          done
+          if [ -n "$APPLY_LIST" ]; then
+            for f in $APPLY_LIST; do kubectl apply -f "$f"; done
+          else
+            echo "No non-STS/non-SC manifests to apply."
+          fi
 
       - name: Recreate StatefulSets to avoid immutability errors
         run: |
           set -e
           cd "${{ steps.resolve.outputs.overlay_path }}"
-          STS="$(kubectl get -f . -o name 2>/dev/null | grep '^statefulset' || true)"
-          if [ -n "$STS" ]; then
-            for n in $STS; do
-              NAME="$(echo "$n" | cut -d'/' -f2)"
-              kubectl -n "$NS" delete statefulset "$NAME" --ignore-not-found=true
+          STS_FILES="$(grep -RIl --include='*.yml' --include='*.yaml' '^[[:space:]]*kind:[[:space:]]*StatefulSet' . || true)"
+          if [ -n "$STS_FILES" ]; then
+            for f in $STS_FILES; do
+              NAME="$(awk '/^[[:space:]]*metadata:[[:space:]]*$/,/^[^ ]/{if($1=="name:"){print $2; exit}}' "$f")"
+              if [ -z "$NAME" ]; then
+                # Fallback to kubectl reading name
+                NAME="$(kubectl create --dry-run=client -f "$f" -o jsonpath='{.metadata.name}' 2>/dev/null || true)"
+              fi
+              if [ -n "$NAME" ]; then
+                kubectl -n "$NS" delete statefulset "$NAME" --ignore-not-found=true
+              fi
+              kubectl apply -f "$f"
             done
-            kubectl apply -f .
+          else
+            echo "No StatefulSets found."
           fi
 
       - name: Wait for core components
