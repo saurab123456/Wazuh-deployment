@@ -75,11 +75,46 @@ jobs:
           fi
           echo "MASTER_POD=$MPOD" >> "$GITHUB_ENV"
           echo "Found master pod: $MPOD"
+
+      - name: Wait for manager (worker) to be Ready
+        shell: bash
+        run: |
+          set -euo pipefail
           WPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -n "$WPOD" ]; then
+          if [ -z "${WPOD:-}" ]; then
+            echo "::warning::No worker pod found (single-node master?)."
+          else
+            for i in {1..120}; do
+              kubectl -n "$NS" wait --for=condition=Ready "pod/$WPOD" --timeout=20s && break || true
+              sleep 2
+            done
             echo "WORKER_POD=$WPOD" >> "$GITHUB_ENV"
             echo "Found worker pod: $WPOD"
           fi
+
+      - name: Normalise manager auth (both nodes) to passwordless (lab)
+        shell: bash
+        run: |
+          set -euo pipefail
+          normalize() {
+            local POD="$1"
+            [ -z "$POD" ] && return 0
+            echo "Normalising auth on $POD ..."
+            kubectl -n "$NS" exec "$POD" -- bash -lc '
+              set -e
+              FILE=/var/ossec/etc/ossec.conf
+              cp "$FILE" "$FILE.bak" || true
+              if grep -q "<use_password>yes</use_password>" "$FILE"; then
+                sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#" "$FILE"
+                supervisorctl restart wazuh-manager || true
+              else
+                echo "Already passwordless on $HOSTNAME"
+              fi
+            '
+          }
+          . "$GITHUB_ENV" || true
+          normalize "${MASTER_POD:-}"
+          normalize "${WORKER_POD:-}"
 
       # (Optional) If your GHCR image is private, create once and then uncomment imagePullSecrets below:
       # kubectl -n wazuh create secret docker-registry ghcr-secret \
@@ -92,6 +127,7 @@ jobs:
         run: |
           set -euo pipefail
           kubectl -n "$NS" logs "$MASTER_POD" --tail=400 || true
+          if [ -n "${WORKER_POD:-}" ]; then kubectl -n "$NS" logs "$WORKER_POD" --tail=200 || true; fi
 
       - name: Apply Services, ConfigMap, and DaemonSet (send events to MASTER first)
         shell: bash
@@ -111,6 +147,7 @@ jobs:
             selector: { app: wazuh-manager, node-type: master }
             ports:
               - { name: authd, port: 1515, protocol: TCP, targetPort: 1515 }
+              - { name: agents-events, port: 1514, protocol: TCP, targetPort: 1514 }
           ---
           apiVersion: v1
           kind: Service
@@ -173,7 +210,6 @@ jobs:
                 tolerations:
                   - { key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule }
                   - { key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }
-                # Uncomment if you created ghcr-secret for private images:
                 # imagePullSecrets:
                 #   - name: ghcr-secret
                 containers:
@@ -304,7 +340,7 @@ jobs:
           if [ -n "${WORKER_POD:-}" ]; then
             echo "=== Worker remoted recent ==="
             kubectl -n "$NS" logs "$WORKER_POD" --tail=300 \
-              | egrep -i 'Listening on port 1514|Agent connected|Invalid ID|Authentication file changed' \
+              | egrep -i 'Listening on port 1514|Accepting connections on port 1515|Agent connected|Invalid ID|Authentication file changed' \
               | tail -n 120 || true
           else
             echo "::warning::No worker pod found; skipping worker log check."
@@ -327,6 +363,11 @@ jobs:
           kubectl -n "$NS" logs "$MASTER_POD" --tail=300 \
             | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" \
             | tail -n 80 || true
+          if [ -n "${WORKER_POD:-}" ]; then
+            kubectl -n "$NS" logs "$WORKER_POD" --tail=300 \
+              | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" \
+              | tail -n 80 || true
+          fi
           echo
           echo "Agent connection logs:"
           for P in $(kubectl -n "$NS" get pods -l app=wazuh-agent -o name); do
