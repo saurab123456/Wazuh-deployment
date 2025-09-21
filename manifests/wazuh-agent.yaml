@@ -5,6 +5,17 @@ metadata:
   labels:
     app.kubernetes.io/name: wazuh
 ---
+# Enrollment password used by agent-auth -P
+# (Replace the placeholder before applying, or kubectl patch it later)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: wazuh-enroll-pass
+  namespace: wazuh
+type: Opaque
+stringData:
+  enroll_pass: "A@min@123"
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -66,10 +77,6 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: 30
 
-      # If your GHCR package is PRIVATE, uncomment and make sure the secret exists in the wazuh namespace:
-      # imagePullSecrets:
-      #   - name: ghcr-cred
-
       tolerations:
         - key: node-role.kubernetes.io/master
           operator: Exists
@@ -90,44 +97,50 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
             - name: AUTHD_PORT
               value: "1515"
             - name: MANAGER_DNS
               value: "wazuh.wazuh.svc.cluster.local"
             - name: GROUPS
               value: "kubernetes"
+            - name: ENROLL_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: wazuh-enroll-pass
+                  key: enroll_pass
           command: ["/bin/sh","-c"]
-          args: |
-            set -e
-            # Build AGENT_NAME from downward API vars
-            AGENT_NAME="${NODE_NAME}-${POD_NAME}"
-            echo "Agent name: ${AGENT_NAME}"
+          args:
+            - |
+              set -e
+              # Prefer stable name per node (avoids dup re-enrolls)
+              AGENT_NAME="${NODE_NAME}"
+              echo "Agent name: ${AGENT_NAME}"
 
-            # Prep dirs and config
-            mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
-            cp /config/ossec.conf /var/ossec/etc/ossec.conf
-            rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
+              # Prep dirs and config
+              mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
+              cp /config/ossec.conf /var/ossec/etc/ossec.conf
+              rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
 
-            # Enroll if needed
-            if [ ! -s /var/ossec/etc/client.keys ]; then
-              echo "No client keys found, enrolling to ${MANAGER_DNS}:${AUTHD_PORT}…"
-              /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" || echo "Enrollment finished (duplicates ok)"
-            fi
+              # Enroll if needed (passworded)
+              if [ ! -s /var/ossec/etc/client.keys ]; then
+                echo "No client keys found, enrolling to ${MANAGER_DNS}:${AUTHD_PORT}…"
+                if [ -n "${GROUPS}" ]; then
+                  /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}" -P "${ENROLL_PASS}" || echo "Enrollment finished (duplicates ok)"
+                else
+                  /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -P "${ENROLL_PASS}" || echo "Enrollment finished (duplicates ok)"
+                fi
+              fi
 
-            # Start agent and follow logs
-            echo "Starting Wazuh agent…"
-            /var/ossec/bin/wazuh-control start
-            sleep 5
-            if /var/ossec/bin/wazuh-control status | grep -q "is running"; then
-              tail -f /var/ossec/logs/ossec.log
-            else
-              /var/ossec/bin/wazuh-control status || true
-              exit 1
-            fi
+              # Start agent and follow logs
+              echo "Starting Wazuh agent…"
+              /var/ossec/bin/wazuh-control start
+              sleep 5
+              if /var/ossec/bin/wazuh-control status | grep -q "is running"; then
+                tail -f /var/ossec/logs/ossec.log
+              else
+                /var/ossec/bin/wazuh-control status || true
+                exit 1
+              fi
           readinessProbe:
             exec:
               command: ["/bin/sh","-c",'/var/ossec/bin/wazuh-control status | grep -q "is running"']
