@@ -22,8 +22,8 @@ jobs:
     env:
       NS: wazuh
       IMAGE: ghcr.io/saurab123456/wazuh-agent:4.12.0
-      AUTHD_PORT: "1515"   # manager authd
-      EVENTS_PORT: "1514"  # remoted/events
+      AUTHD_PORT: "1515"     # manager authd (registration)
+      EVENTS_PORT: "1514"    # remoted/events
 
     steps:
       - name: Checkout
@@ -57,90 +57,66 @@ jobs:
           kubectl get nodes -o wide || true
           kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
 
-      - name: Wait for manager (master) to be Ready
+      - name: Locate manager pods
         shell: bash
         run: |
           set -euo pipefail
-          for i in {1..120}; do
-            MPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=master -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-            if [ -n "$MPOD" ]; then
-              kubectl -n "$NS" wait --for=condition=Ready "pod/$MPOD" --timeout=20s && break || true
-            fi
-            sleep 2
-          done
-          if [ -z "${MPOD:-}" ]; then
-            echo "::error::No wazuh-manager master pod found in ns $NS"
-            kubectl -n "$NS" get pods -l app=wazuh-manager || true
-            exit 1
-          fi
-          echo "MASTER_POD=$MPOD" >> "$GITHUB_ENV"
-          echo "Found master pod: $MPOD"
-
-      - name: Wait for manager (worker) to be Ready
-        shell: bash
-        run: |
-          set -euo pipefail
+          MPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=master -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
           WPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          if [ -z "${WPOD:-}" ]; then
-            echo "::warning::No worker pod found (single-node master?)."
-          else
-            for i in {1..120}; do
-              kubectl -n "$NS" wait --for=condition=Ready "pod/$WPOD" --timeout=20s && break || true
-              sleep 2
-            done
-            echo "WORKER_POD=$WPOD" >> "$GITHUB_ENV"
-            echo "Found worker pod: $WPOD"
-          fi
+          [ -z "$MPOD" ] && { echo "::error::No master manager pod found"; exit 1; }
+          echo "MASTER_POD=$MPOD" >> "$GITHUB_ENV"
+          [ -n "$WPOD" ] && echo "WORKER_POD=$WPOD" >> "$GITHUB_ENV"
+          kubectl -n "$NS" wait --for=condition=Ready "pod/$MPOD" --timeout=180s || true
+          [ -n "$WPOD" ] && kubectl -n "$NS" wait --for=condition=Ready "pod/$WPOD" --timeout=180s || true
 
-      - name: Normalise manager auth (both) to passwordless and restart
+      - name: Force BOTH managers to passwordless + restart
         shell: bash
         run: |
           set -euo pipefail
           . "$GITHUB_ENV" || true
-          normalize() {
+          patch_no_pass () {
             local POD="$1"
             [ -z "$POD" ] && return 0
-            echo "Normalising auth on $POD ..."
+            echo "Setting <use_password>no</use_password> on $POD"
             kubectl -n "$NS" exec "$POD" -- bash -lc '
               set -e
               FILE=/var/ossec/etc/ossec.conf
-              cp "$FILE" "$FILE.bak" || true
-              if grep -q "<use_password>yes</use_password>" "$FILE"; then
-                sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#" "$FILE"
-                supervisorctl restart wazuh-manager
+              cp -f "$FILE" "$FILE.bak" || true
+              # normalize to "no" regardless of current value
+              if grep -q "<use_password>" "$FILE"; then
+                sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#g" "$FILE"
+                sed -i "s#<use_password>no</use_password>#<use_password>no</use_password>#g" "$FILE"
               else
-                echo "Already passwordless on $HOSTNAME"
-                supervisorctl restart wazuh-manager || true
+                # add explicitly under <auth> if the tag is missing (rare)
+                awk '\''{
+                  print
+                  if ($0 ~ /<auth>/) {print "    <use_password>no</use_password>"}
+                }'\'' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
               fi
+              supervisorctl restart wazuh-manager
             '
-            # wait for authd to come back
-            for i in {1..20}; do
-              if kubectl -n "$NS" logs "$POD" --tail=200 | egrep -qi 'ossec-authd|Accepting connections on port 1515'; then
-                break
-              fi
+          }
+          patch_no_pass "${MASTER_POD:-}"
+          patch_no_pass "${WORKER_POD:-}"
+
+          wait_authd () {
+            local POD="$1"
+            [ -z "$POD" ] && return 0
+            for i in {1..90}; do
+              kubectl -n "$NS" logs "$POD" --tail=200 \
+                | egrep -qi "ossec-authd|Accepting connections on port 1515" && { echo "$POD authd ready"; return 0; }
               sleep 2
             done
+            echo "::warning::$POD authd readiness not confirmed; continuing."
           }
-          normalize "${MASTER_POD:-}"
-          normalize "${WORKER_POD:-}"
+          wait_authd "${MASTER_POD:-}"
+          wait_authd "${WORKER_POD:-}"
 
-      - name: Confirm manager ports
+      - name: Apply Services, ConfigMap, and DaemonSet (enroll to MASTER; flip later)
         shell: bash
         run: |
           set -euo pipefail
-          . "$GITHUB_ENV" || true
-          echo "=== Master last lines ==="
-          kubectl -n "$NS" logs "$MASTER_POD" --tail=300 || true
-          if [ -n "${WORKER_POD:-}" ]; then
-            echo "=== Worker last lines ==="
-            kubectl -n "$NS" logs "$WORKER_POD" --tail=200 || true
-          fi
-
-      - name: Apply Services, ConfigMap, and DaemonSet (enroll to MASTER, then flip)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat <<EOF | kubectl -n "$NS" apply -f -
+          cat <<'EOF' | envsubst | kubectl -n "$NS" apply -f -
           ---
           apiVersion: v1
           kind: Service
@@ -233,31 +209,27 @@ jobs:
                     args:
                       - |
                         set -e
-                        AGENT_NAME="\${NODE_NAME}"
-                        echo "Agent name: \$AGENT_NAME"
+                        AGENT_NAME="${NODE_NAME}"
+                        echo "Agent name: ${AGENT_NAME}"
 
-                        # copy config
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
 
-                        # Clean any stale entry with same name to avoid authd rejection
-                        ( /var/ossec/bin/agent_control -lc 2>/dev/null | grep -q "\$AGENT_NAME" ) && echo "Warning: agent '\$AGENT_NAME' already listed on manager."
-
                         enroll() {
-                          echo "Enrolling to \${MANAGER_DNS}:\${AUTHD_PORT} (group=\${GROUPS})…"
-                          if [ -n "\${GROUPS}" ]; then
-                            /var/ossec/bin/agent-auth -m "\${MANAGER_DNS}" -p "\${AUTHD_PORT}" -A "\${AGENT_NAME}" -G "\${GROUPS}"
+                          echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS})…"
+                          if [ -n "${GROUPS}" ]; then
+                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS}"
                           else
-                            /var/ossec/bin/agent-auth -m "\${MANAGER_DNS}" -p "\${AUTHD_PORT}" -A "\${AGENT_NAME}"
+                            /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}"
                           fi
                         }
 
-                        # Retry enrollment up to 18 times
+                        # Retry enrollment (3 minutes total)
                         if [ ! -s /var/ossec/etc/client.keys ]; then
-                          for i in \$(seq 1 18); do
+                          for i in $(seq 1 18); do
                             if enroll; then break; fi
-                            echo "Enroll attempt \$i failed; retrying in 10s…"
+                            echo "Enroll attempt $i failed; retrying in 10s…"
                             sleep 10
                           done
                         fi
@@ -301,45 +273,20 @@ jobs:
                   - { name: varlog,           hostPath: { path: /var/log,            type: Directory } }
           EOF
 
-          # Give the DS a head start; if it stalls, we'll dump logs below
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
 
-      - name: If agents crashing, dump logs
-        shell: bash
-        run: |
-          set -euo pipefail
-          bad=0
-          for P in $(kubectl -n "$NS" get pods -l app=wazuh-agent -o jsonpath='{.items[*].metadata.name}'); do
-            PHASE=$(kubectl -n "$NS" get pod "$P" -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || echo "")
-            READY=$(kubectl -n "$NS" get pod "$P" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || echo "false")
-            if [ "$READY" != "true" ]; then
-              bad=1
-              echo "==== $P (not ready; phase=$PHASE) ===="
-              kubectl -n "$NS" logs "$P" --previous --tail=200 || true
-              kubectl -n "$NS" logs "$P" --tail=200 || true
-            fi
-          done
-          if [ "$bad" -eq 1 ]; then
-            echo "::warning::Some agent pods are not ready; see logs above."
-          fi
-
-      - name: Verify enrollment on manager
+      - name: Verify enrollment on master
         shell: bash
         run: |
           set -euo pipefail
           . "$GITHUB_ENV" || true
-          ok=0
           for i in {1..24}; do
-            KEYS=$(kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc 'test -f /var/ossec/etc/client.keys && wc -l /var/ossec/etc/client.keys | awk "{print \$1}" || echo 0' || echo 0)
             COUNT=$(kubectl -n "$NS" exec "$MASTER_POD" -- sh -lc "/var/ossec/bin/agent_control -lc | grep -E '^[[:space:]]*ID:' | grep -v '(server)' | wc -l" || echo 0)
-            echo "client.keys lines: $KEYS, agent_control count: $COUNT"
-            if [ "${COUNT:-0}" -ge 1 ] || [ "${KEYS:-0}" -ge 5 ]; then ok=1; break; fi
+            echo "Active agents visible: $COUNT"
+            [ "$COUNT" -ge 1 ] && break
             sleep 5
           done
-          if [ "$ok" -ne 1 ]; then
-            echo "::warning::Enrollment not visible yet; continuing."
-          fi
 
       - name: Flip agent events to workers & restart DS
         shell: bash
@@ -351,49 +298,22 @@ jobs:
           kubectl -n "$NS" rollout restart ds/wazuh-agent
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
 
-      - name: Verify worker remoted connections and Active agents
-        shell: bash
-        run: |
-          set -euo pipefail
-          . "$GITHUB_ENV" || true
-          if [ -z "${WORKER_POD:-}" ]; then
-            WORKER_POD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-            [ -n "$WORKER_POD" ] && echo "WORKER_POD=$WORKER_POD" >> "$GITHUB_ENV"
-          fi
-          if [ -n "${WORKER_POD:-}" ]; then
-            echo "=== Worker remoted/authd recent ==="
-            kubectl -n "$NS" logs "$WORKER_POD" --tail=300 \
-              | egrep -i 'Listening on port 1514|Accepting connections on port 1515|Agent connected|Invalid ID|Authentication file changed' \
-              | tail -n 120 || true
-          fi
-          echo "=== agent_control -lc (on master) ==="
-          kubectl -n "$NS" exec "$MASTER_POD" -- /var/ossec/bin/agent_control -lc || true
-
       - name: Final diagnostics
         shell: bash
         run: |
           set -euo pipefail
-          echo "Pods:"
-          kubectl -n "$NS" get pods -o wide || true
-          echo
-          echo "Services:"
-          kubectl -n "$NS" get svc wazuh wazuh-workers -o wide || true
-          echo
-          echo "Authd/Remoted signals:"
           . "$GITHUB_ENV" || true
-          kubectl -n "$NS" logs "$MASTER_POD" --tail=300 \
-            | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" \
-            | tail -n 80 || true
+          echo "Pods:" && kubectl -n "$NS" get pods -o wide || true
+          echo
+          echo "Services:" && kubectl -n "$NS" get svc wazuh wazuh-workers -o wide || true
+          echo
+          echo "Authd/Remoted signals (master):"
+          kubectl -n "$NS" logs "$MASTER_POD" --tail=300 | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" | tail -n 80 || true
           if [ -n "${WORKER_POD:-}" ]; then
-            kubectl -n "$NS" logs "$WORKER_POD" --tail=300 \
-              | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" \
-              | tail -n 80 || true
+            echo
+            echo "Authd/Remoted signals (worker):"
+            kubectl -n "$NS" logs "$WORKER_POD" --tail=300 | egrep -i "Accepting connections on port 1515|Listening on port 1514/TCP" | tail -n 80 || true
           fi
           echo
-          echo "Agent connection logs:"
-          for P in $(kubectl -n "$NS" get pods -l app=wazuh-agent -o name); do
-            echo "=== $P ==="
-            kubectl -n "$NS" logs "$P" --tail=300 \
-              | egrep -i "Valid key|Reading authentication keys|Trying to connect|Connected to server|keep alive|agent-auth" \
-              | tail -n 80 || true
-          done
+          echo "agent_control -lc (master):"
+          kubectl -n "$NS" exec "$MASTER_POD" -- /var/ossec/bin/agent_control -lc || true
