@@ -258,17 +258,26 @@ jobs:
             echo "Nothing to apply in non-STS/SC set."
           fi
 
+      # ------------ FIXED: robust delete & recreate of StatefulSets ------------
       - name: Recreate StatefulSets to avoid immutability errors
         run: |
           set -e
-          yq -r e 'select(.kind == "StatefulSet") | .metadata.name' /tmp/wazuh-all.yaml > /tmp/sts-names.txt
-          if [ -s /tmp/sts-names.txt ]; then
-            xargs -r -a /tmp/sts-names.txt -I{} kubectl -n "$NS" delete statefulset {} --ignore-not-found=true
+          # Extract clean names only (no separators/nulls), one per line
+          NAMES="$(yq -r 'select(.kind == "StatefulSet" and .metadata.name != null) | .metadata.name' /tmp/wazuh-all.yaml \
+                   | sed 's/\r$//' \
+                   | grep -E '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$' || true)"
+          if [ -n "$NAMES" ]; then
+            for n in $NAMES; do
+              echo "Deleting STS: $n"
+              kubectl -n "$NS" delete statefulset "$n" --ignore-not-found=true
+            done
+            echo "$NAMES" | sed 's/^/- /'
             yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-sts.yaml
             kubectl -n "$NS" apply -f /tmp/wazuh-sts.yaml
           else
             echo "No StatefulSets in build."
           fi
+      # ------------------------------------------------------------------------
 
       - name: Wait for core components
         run: |
