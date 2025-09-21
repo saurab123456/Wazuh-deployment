@@ -254,7 +254,7 @@ jobs:
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      # --------- FIX: patch managers without killing exec (no in-container restart)
+      # --------- Enable passwordless enrollment on managers ---------
       - name: Enable passwordless authd on ALL managers
         env:
           MANAGER_SELECTOR: app=wazuh-manager
@@ -264,7 +264,6 @@ jobs:
           test -n "$PODS" || { echo "No manager pods found"; exit 1; }
           for POD in $PODS; do
             echo ">> Patching $POD"
-            # try with explicit container first, fall back to default
             kubectl -n "$NS" exec "$POD" -c wazuh-manager -- sh -lc '
               set -e
               CONF=/var/ossec/etc/ossec.conf
@@ -328,34 +327,23 @@ jobs:
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=300s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
 
-      - name: Expose Dashboard via fixed NodePort
+      # ---------- Discover dashboard port & port-forward (no hardcoded ports) ----------
+      - name: Discover Dashboard port
+        id: dash
         run: |
-          set -e
-          DASH_SVC="wazuh-dashboard-nodeport"
-          NODEPORT=30443
-          cat <<EOF | kubectl apply -f -
-          apiVersion: v1
-          kind: Service
-          metadata: { name: ${DASH_SVC}, namespace: ${NS} }
-          spec:
-            type: NodePort
-            selector: { app: wazuh-dashboard }
-            ports:
-              - name: https
-                port: 443
-                targetPort: 443
-                protocol: TCP
-                nodePort: ${NODEPORT}
-          EOF
-          NODE_IP="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' | head -n1)"
-          echo "WAZUH_NODEPORT_URL=https://${NODE_IP}:${NODEPORT}"
-
-      - name: Quick HTTPS check (NodePort)
-        run: |
-          set +e
-          NODE_IP="$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' | head -n1)"
-          STATUS="$(curl -kIs --connect-timeout 10 "https://${NODE_IP}:30443" | head -n1 || true)"
-          echo "Status line from dashboard: ${STATUS:-<no response>}"
+          set -euo pipefail
+          # Try Service first: prefer the "port" field (what clients hit), else targetPort
+          PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
+          if [ -z "${PORT:-}" ]; then
+            PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].targetPort}' 2>/dev/null || true)"
+          fi
+          # Fall back to the containerPort on the deployment
+          if [ -z "${PORT:-}" ]; then
+            PORT="$(kubectl -n "$NS" get deploy wazuh-dashboard -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || true)"
+          fi
+          test -n "${PORT:-}" || { echo "::error::Could not determine dashboard port"; exit 1; }
+          echo "dash_port=${PORT}" >> "$GITHUB_OUTPUT"
+          echo "Discovered dashboard port: ${PORT}"
 
       - name: Start Dashboard port-forward (auto)
         if: ${{ inputs.enable_port_forward == 'true' }}
@@ -364,17 +352,20 @@ jobs:
           PF_PORT: ${{ inputs.local_forward_port }}
         run: |
           set -euo pipefail
-          # kill any existing forward on same port (best-effort)
-          (pkill -f "port-forward .*:${PF_PORT}:443" && sleep 1) || true
-          echo "Starting: kubectl -n ${NS} port-forward --address ${PF_BIND} svc/wazuh-dashboard-nodeport ${PF_PORT}:443"
-          nohup kubectl -n "${NS}" port-forward --address "${PF_BIND}" svc/wazuh-dashboard-nodeport "${PF_PORT}:443" > portforward.log 2>&1 &
+          TARGET_PORT="${{ steps.dash.outputs.dash_port }}"
+          # best-effort kill any existing forward on same local port
+          (pkill -f "port-forward .*:${PF_PORT}:" && sleep 1) || true
+          echo "Starting PF: localhost:${PF_PORT} -> deploy/wazuh-dashboard:${TARGET_PORT}"
+          nohup kubectl -n "${NS}" port-forward --address "${PF_BIND}" deploy/wazuh-dashboard "${PF_PORT}:${TARGET_PORT}" > portforward.log 2>&1 &
+          # Wait until it answers
           for i in $(seq 1 30); do
             sleep 2
-            if curl -kIs --connect-timeout 2 "https://localhost:${PF_PORT}" >/dev/null 2>&1; then
+            if curl -Is --connect-timeout 2 "http://localhost:${PF_PORT}" >/dev/null 2>&1 || \
+               curl -kIs --connect-timeout 2 "https://localhost:${PF_PORT}" >/dev/null 2>&1; then
               break
             fi
           done
-          echo "::notice title=Browse Now::Open https://localhost.com:${PF_PORT} (or https://localhost:${PF_PORT}) and accept the self-signed certificate."
+          echo "::notice title=Browse Now::Open http://localhost:${PF_PORT} (or https://localhost:${PF_PORT} if TLS is enabled in your manifests)"
           timeout 45m tail -f portforward.log || true
 
       - name: Final status
