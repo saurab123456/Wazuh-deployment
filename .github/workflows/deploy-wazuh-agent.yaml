@@ -22,8 +22,8 @@ jobs:
     env:
       NS: wazuh
       IMAGE: ghcr.io/saurab123456/wazuh-agent:4.12.0
-      AUTHD_PORT: "1515"     # manager authd (registration)
-      EVENTS_PORT: "1514"    # remoted/events
+      AUTHD_PORT: "1515"
+      EVENTS_PORT: "1514"
 
     steps:
       - name: Checkout
@@ -53,7 +53,6 @@ jobs:
           mkdir -p "$HOME/.kube"
           echo "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
-          echo "Context: $(kubectl config current-context || true)"
           kubectl get nodes -o wide || true
           kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
 
@@ -61,91 +60,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          MPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=master -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          WPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-          
-          if [ -z "$MPOD" ]; then
-            echo "::error::No master manager pod found"
-            # Try alternative label selectors
-            MPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
-            if [ -z "$MPOD" ]; then
-              echo "::error::No wazuh manager pod found with any label selector"
-              exit 1
-            fi
-          fi
-          
+          MPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=master -o jsonpath='{.items[0].metadata.name}' || true)"
+          WPOD="$(kubectl -n "$NS" get pod -l app=wazuh-manager,node-type=worker -o jsonpath='{.items[0].metadata.name}' || true)"
+          [ -z "$MPOD" ] && { echo "::error::No master pod found"; exit 1; }
           echo "MASTER_POD=$MPOD" >> "$GITHUB_ENV"
           [ -n "$WPOD" ] && echo "WORKER_POD=$WPOD" >> "$GITHUB_ENV"
-          
           kubectl -n "$NS" wait --for=condition=Ready "pod/$MPOD" --timeout=180s || true
           [ -n "$WPOD" ] && kubectl -n "$NS" wait --for=condition=Ready "pod/$WPOD" --timeout=180s || true
 
-      - name: Force BOTH managers to passwordless + restart
+      - name: Force BOTH managers to passwordless + restart pods
         shell: bash
         run: |
           set -euo pipefail
           . "$GITHUB_ENV" || true
-          
-          patch_no_pass () {
+          make_pwless () {
             local POD="$1"
             [ -z "$POD" ] && return 0
-            echo "Setting <use_password>no</use_password> on $POD"
-            
-            kubectl -n "$NS" exec "$POD" -- bash -lc '
-              set -e
+            echo "Forcing passwordless auth in $POD"
+            kubectl -n "$NS" exec "$POD" -- sh -lc '
               FILE=/var/ossec/etc/ossec.conf
               cp -f "$FILE" "$FILE.bak" || true
-              
-              # Check if file exists and is readable
-              if [ ! -f "$FILE" ] || [ ! -r "$FILE" ]; then
-                echo "::error::Cannot read ossec.conf file"
-                exit 1
-              fi
-              
-              # Check if auth section exists
-              if ! grep -q "<auth>" "$FILE"; then
-                echo "::error::No <auth> section found in ossec.conf"
-                exit 1
-              fi
-              
-              # Update or add use_password setting
               if grep -q "<use_password>" "$FILE"; then
-                sed -i "s#<use_password>.*</use_password>#<use_password>no</use_password>#g" "$FILE"
+                sed -i "s#<use_password>yes</use_password>#<use_password>no</use_password>#g" "$FILE"
               else
-                # Insert after <auth> line
-                sed -i '/<auth>/a \    <use_password>no</use_password>' "$FILE"
+                awk '"'"'{print} /<auth>/ {print "    <use_password>no</use_password>"}'"'"' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
               fi
-              
-              # Verify the change was made
-              if ! grep -q "<use_password>no</use_password>" "$FILE"; then
-                echo "::error::Failed to set use_password to no"
-                exit 1
-              fi
-              
-              echo "Restarting wazuh-manager..."
-              supervisorctl restart wazuh-manager
             '
-            
-            # Check if the command succeeded
-            if [ $? -ne 0 ]; then
-              echo "::warning::Failed to configure passwordless auth on $POD, continuing anyway"
-            fi
+            kubectl -n "$NS" delete pod "$POD"
           }
-          
-          patch_no_pass "${MASTER_POD:-}"
-          patch_no_pass "${WORKER_POD:-}"
+          make_pwless "${MASTER_POD:-}"
+          make_pwless "${WORKER_POD:-}"
 
-          wait_authd () {
-            local POD="$1"
-            [ -z "$POD" ] && return 0
-            for i in {1..90}; do
-              kubectl -n "$NS" logs "$POD" --tail=200 \
-                | egrep -qi "ossec-authd|Accepting connections on port 1515" && { echo "$POD authd ready"; return 0; }
-              sleep 2
-            done
-            echo "::warning::$POD authd readiness not confirmed; continuing."
-          }
-          wait_authd "${MASTER_POD:-}"
-          wait_authd "${WORKER_POD:-}"
+          # Wait for pods to come back
+          kubectl -n "$NS" rollout status sts/wazuh-manager-master --timeout=300s || true
+          kubectl -n "$NS" rollout status sts/wazuh-manager-worker --timeout=300s || true
 
-      # ... rest of the steps remain the same as in your original file
+      # (the rest of your workflow: Services, ConfigMap, DaemonSet, verify, flip events, diagnostics … stays unchanged)
