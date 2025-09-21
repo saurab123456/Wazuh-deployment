@@ -7,17 +7,14 @@ on:
         description: "Overlay to deploy (single or production)"
         required: true
         default: single
-        type: choice
-        options: [single, production]
       wazuh_tag:
         description: "wazuh-kubernetes repo tag (e.g., v4.12.0)"
         required: true
         default: v4.12.0
       cleanup_unbound_pvcs:
-        description: "Delete only UNBOUND PVCs before deploy"
+        description: "Delete only UNBOUND PVCs before deploy (true/false)"
         required: true
-        default: true
-        type: boolean
+        default: "true"
       local_forward_port:
         description: "Local port for port-forward (optional)"
         required: true
@@ -196,7 +193,7 @@ jobs:
           ls -la "$pick" | sed -n '1,200p'
 
       - name: (Optional) Safe cleanup: unbound PVCs only
-        if: ${{ inputs.cleanup_unbound_pvcs }}
+        if: ${{ inputs.cleanup_unbound_pvcs == 'true' }}
         run: |
           set -euo pipefail
           echo "Checking for UNBOUND PVCs in namespace $NS..."
@@ -282,14 +279,13 @@ jobs:
               nodePort: ${NODEPORT}
           EOF
           NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}' | head -n1)
-          echo "🌐 Wazuh Dashboard fixed URL: https://${NODE_IP}:${NODEPORT}"
-          echo "✅ Service available at svc/${DASH_SVC} in namespace ${NS}"
+          echo "WAZUH_NODEPORT_URL=https://${NODE_IP}:${NODEPORT}"
 
       # --------- Optional localhost port-forward one-liner ----------
       - name: Print port-forward one-liner (optional)
         run: |
-          echo "🔌 If you prefer localhost instead of NodePort, run:"
-          echo "    kubectl -n ${NS} port-forward svc/wazuh-dashboard-nodeport ${LOCAL_FORWARD_PORT}:443"
+          echo "If you prefer localhost instead of NodePort, run:"
+          echo "  kubectl -n ${NS} port-forward svc/wazuh-dashboard-nodeport ${LOCAL_FORWARD_PORT}:443"
           echo "Then open: https://localhost:${LOCAL_FORWARD_PORT}  (accept the self-signed cert)"
 
       - name: Final status
