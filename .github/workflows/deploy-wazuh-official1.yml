@@ -147,22 +147,62 @@ jobs:
           git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
           ls -la wazuh-kubernetes | sed -n '1,120p'
 
+      # ========= FIXED STEP =========
       - name: Resolve overlay path (auto-detect)
         id: resolve
         run: |
-          set -e
+          set -euo pipefail
           WANT="${OVERLAY_CHOICE}"
-          CANDS="$(grep -RIl --include='*.yml' --include='*.yaml' -e 'wazuh-dashboard\\|wazuh-manager\\|wazuh-indexer' wazuh-kubernetes 2>/dev/null | xargs -r -n1 dirname | sort -u)"
-          test -n "$CANDS" || { echo "::error::No Wazuh manifests found in repo"; exit 1; }
+          ROOT="wazuh-kubernetes/wazuh"
+
+          echo "Repo tree (top level):"
+          ls -la wazuh-kubernetes | sed -n '1,120p' || true
+          echo "Repo tree ($ROOT):"
+          ls -la "$ROOT" | sed -n '1,200p' || true
+
+          CANDIDATES=""
+
+          # Preferred well-known overlays
+          if [ -d "$ROOT/single-node" ]; then
+            CANDIDATES="${CANDIDATES}"$'\n'"$ROOT/single-node"
+          fi
+          if [ -d "$ROOT/production" ]; then
+            CANDIDATES="${CANDIDATES}"$'\n'"$ROOT/production"
+          fi
+
+          # Fallback: any kustomization.yaml inside wazuh/
+          MORE=$(find "$ROOT" -type f -name 'kustomization.yaml' -printf '%h\n' | sort -u || true)
+          if [ -n "$MORE" ]; then
+            CANDIDATES="$(printf "%s\n%s\n" "$CANDIDATES" "$MORE" | awk 'NF' | sort -u)"
+          fi
+
+          if [ -z "$CANDIDATES" ]; then
+            echo "::error::Could not find any kustomize overlays under $ROOT"
+            exit 1
+          fi
+
+          echo "Detected candidate overlays:"
+          echo "$CANDIDATES" | nl -ba
+
           PICK=""
-          while IFS= read -r d; do
-            low="$(echo "$d" | tr '[:upper:]' '[:lower:]')"
-            if [ "$WANT" = "single" ] && echo "$low" | grep -q single; then PICK="$d"; break; fi
-            if [ "$WANT" = "production" ] && echo "$low" | grep -q prod;  then PICK="$d"; break; fi
-          done <<< "$CANDS"
-          if [ -z "$PICK" ]; then PICK="$(echo "$CANDS" | head -n1)"; fi
+          case "$(echo "$WANT" | tr '[:upper:]' '[:lower:]')" in
+            single|single-node)
+              PICK=$(echo "$CANDIDATES" | awk '/single-node/{print; exit}')
+              ;;
+            prod|production)
+              PICK=$(echo "$CANDIDATES" | awk '/production/{print; exit}')
+              ;;
+          esac
+
+          # If not matched, take the first candidate
+          if [ -z "$PICK" ]; then
+            PICK=$(echo "$CANDIDATES" | head -n1)
+          fi
+
+          test -n "$PICK" || { echo "::error::No overlay selected"; exit 1; }
           echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
-          echo "Resolved: $PICK"
+          echo "Resolved overlay_path=$PICK"
+      # ========= END FIXED STEP =========
 
       # ---------- CERTS ----------
       - name: Generate self-signed certs for Kustomize (indexer + dashboard_http)
@@ -335,19 +375,12 @@ jobs:
 
           kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
 
-          # If your DaemonSet is named differently, adjust here:
           if kubectl -n "$NS" get ds/wazuh-agent >/dev/null 2>&1; then
             kubectl -n "$NS" rollout restart ds/wazuh-agent
             kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
           else
             echo "DaemonSet 'wazuh-agent' not found (skip restart)"; 
           fi
-
-          # Fallback: if your agent image uses agent-auth CLI in entrypoint, export password for it
-          echo "Wiring password into existing agent pods (if they exec agent-auth)..."
-          for P in $(kubectl -n "$NS" get pods -l app=wazuh-agent -o name 2>/dev/null || true); do
-            kubectl -n "$NS" exec "$P" -- sh -lc 'echo "Agent pod present: $HOSTNAME"'
-          done
 
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide || true
 
