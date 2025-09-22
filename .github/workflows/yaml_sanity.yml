@@ -1,131 +1,42 @@
-name: kubeconfig-test
+name: CI on Ronin
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
 
 jobs:
-  probe:
-    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
-
+  build-and-deploy:
+    runs-on: [self-hosted, linux, ronin]   # must match labels you set
+    timeout-minutes: 60
     env:
-      # Destination for the kubeconfig we write
       KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
-
-      # Provide one of these secrets:
-      RAW_KCFG:    ${{ secrets.KUBECONFIG }}                  # RAW ~/.kube/config (recommended)
-      KCFG_NEW_B64: ${{ secrets.KUBE_CONFIG_B64_RONIN_NEW }}  # base64 of ~/.kube/config (optional)
-      KCFG_OLD_B64: ${{ secrets.KUBE_CONFIG_B64 }}            # base64 of ~/.kube/config (optional)
-
-      # Optional comma-separated candidates, e.g.: "10.0.8.78:6443,https://10.0.8.78:6443"
-      API_CANDIDATES: ${{ secrets.RONIN_API_CANDIDATES }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure kubectl & yq
+      - name: Write kubeconfig
+        if: secrets.KUBECONFIG != ''
         shell: bash
         run: |
-          set -euo pipefail
-          BIN="$HOME/.local/bin"; mkdir -p "$BIN"
-          # make it available both now and in later steps
-          export PATH="$BIN:$PATH"
-          echo "$BIN" >> "$GITHUB_PATH"
-
-          # kubectl
-          if ! command -v kubectl >/dev/null 2>&1; then
-            echo "Installing kubectl..."
-            curl -fsSL -o "$BIN/kubectl" "https://dl.k8s.io/release/v1.30.14/bin/linux/amd64/kubectl"
-            chmod +x "$BIN/kubectl"
-          fi
-
-          # yq
-          if ! command -v yq >/dev/null 2>&1; then
-            echo "Installing yq..."
-            curl -fsSL -o "$BIN/yq" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
-            chmod +x "$BIN/yq"
-          fi
-
-          echo "which kubectl: $(which kubectl)"
-          kubectl version --client=true || true
-          echo "which yq: $(which yq)"
-          yq --version || true
-
-      - name: Write kubeconfig (prefer RAW, then base64)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${RAW_KCFG:-}" ]; then
-            echo "Using RAW kubeconfig from secret KUBECONFIG"
-            printf "%s" "$RAW_KCFG" > "$KUBECONFIG"
-          elif [ -n "${KCFG_NEW_B64:-}" ]; then
-            echo "Using base64 kubeconfig from secret KUBE_CONFIG_B64_RONIN_NEW"
-            printf "%s" "$KCFG_NEW_B64" | base64 -d > "$KUBECONFIG"
-          elif [ -n "${KCFG_OLD_B64:-}" ]; then
-            echo "Using base64 kubeconfig from secret KUBE_CONFIG_B64"
-            printf "%s" "$KCFG_OLD_B64" | base64 -d > "$KUBECONFIG"
-          else
-            echo "::error::No kubeconfig secret provided (set KUBECONFIG raw, or KUBE_CONFIG_B64_* base64)."
-            exit 1
-          fi
+          # If you stored raw kubeconfig in the secret:
+          printf '%s' "${{ secrets.KUBECONFIG }}" > "$KUBECONFIG"
           chmod 600 "$KUBECONFIG"
 
-          echo "== kubeconfig summary (redacted) =="
-          # Use // "" instead of // empty to avoid lexer errors
-          yq -r '.clusters[]? | .name + " -> " + (.cluster.server // "")' "$KUBECONFIG" || true
-          yq -r '.clusters[]?.cluster | {has_ca_data: has("certificate-authority-data")}' "$KUBECONFIG" || true
-          yq -r '.users[]?.user | {has_client_cert_data: has("client-certificate-data"), has_client_key_data: has("client-key-data")}' "$KUBECONFIG" || true
-
-      - name: Connect to API
+      - name: Ensure kubectl (no sudo)
         shell: bash
         run: |
-          set -euo pipefail
-
-          trim() { awk '{$1=$1;print}'; }
-
-          try_url () {
-            local url="$(echo "$1" | trim)"
-            if [ -z "$url" ]; then
-              echo "Skip blank URL"
-              return 1
-            fi
-
-            # Normalize: add https:// if missing
-            case "$url" in
-              https://*) ;;
-              *:[0-9][0-9][0-9][0-9]*) url="https://$url" ;;
-              *) url="https://$url:6443" ;;
-            esac
-
-            echo "Trying $url ..."
-            # Set it on all clusters in the file
-            yq -i ".clusters[].cluster.server = \"$url\"" "$KUBECONFIG"
-
-            if kubectl --request-timeout=10s cluster-info >/dev/null 2>&1; then
-              echo "✅ Connected to $url"
-              kubectl cluster-info
-              kubectl get nodes -o wide || true
-              kubectl get ns || true
-              return 0
-            fi
-            echo "Failed $url, trying next…"
-            return 1
-          }
-
-          # 1) servers from kubeconfig (skip blanks safely)
-          mapfile -t SERVERS < <(yq -r '.clusters[]?.cluster.server // ""' "$KUBECONFIG")
-          for S in "${SERVERS[@]:-}"; do
-            try_url "$S" && exit 0
-          done
-
-          # 2) candidates (optional)
-          if [ -n "${API_CANDIDATES:-}" ]; then
-            IFS=',' read -ra ARR <<< "$API_CANDIDATES"
-            for raw in "${ARR[@]}"; do
-              try_url "$raw" && exit 0
-            done
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSLo "$HOME/.local/bin/kubectl" "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x "$HOME/.local/bin/kubectl"
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
           fi
 
-          echo "::error::Could not reach any Kubernetes API endpoint."
-          echo "Check: correct kubeconfig, runner can reach 10.0.8.78:6443 (firewall/SG), and secrets set."
-          exit 1
+      - name: Sanity check cluster
+        run: kubectl get nodes -o wide
+
+      - name: Your deploy step
+        run: |
+          # e.g., kubectl apply -k k8s/overlays/single
+          echo "Do deploy here"
