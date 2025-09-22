@@ -52,23 +52,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$HOME/bin"
-          echo "$HOME/bin" >> "$GITHUB_PATH"   # <-- make tools available to ALL later steps
+          echo "$HOME/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/bin:$PATH"
-
-          # kubectl
           if ! command -v kubectl >/dev/null 2>&1; then
             KVER="$(curl -sS https://dl.k8s.io/release/stable.txt)"
             curl -sSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o "$HOME/bin/kubectl"
             chmod +x "$HOME/bin/kubectl"
           fi
-
-          # yq
           if ! command -v yq >/dev/null 2>&1; then
             curl -sSL -o "$HOME/bin/yq" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
             chmod +x "$HOME/bin/yq"
           fi
-
-          # jq
           if ! command -v jq >/dev/null 2>&1; then
             curl -sSL -o "$HOME/bin/jq" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
             chmod +x "$HOME/bin/jq"
@@ -131,26 +125,51 @@ jobs:
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
 
-      - name: Prepare StorageClass alias 'wazuh-storage'
+      - name: Prepare StorageClass alias 'wazuh-storage' (safe create/replace)
         shell: bash
         run: |
           set -euo pipefail
-          # Try default dynamic SC; if missing, fall back to local-path (assumes it's present on your node)
+          # 1) Pick a dynamic SC (prefer default; else try local-path)
           TARGET_SC="$(kubectl get sc -o json | yq -r '.items[] | select(.metadata.annotations."storageclass.kubernetes.io/is-default-class"=="true") | .metadata.name' | head -n1 || true)"
           if [ -z "${TARGET_SC:-}" ]; then
-            echo "::warning::No default dynamic StorageClass found; using 'local-path' (ensure local-path-provisioner is installed)"
-            TARGET_SC="local-path"
+            if kubectl get sc local-path >/dev/null 2>&1; then
+              TARGET_SC="local-path"
+            else
+              echo "::error::No default StorageClass found and 'local-path' is missing. Please install a dynamic provisioner."; exit 1
+            fi
           fi
           PROV="$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')"
-          cat <<EOF | kubectl apply -f -
-          apiVersion: storage.k8s.io/v1
-          kind: StorageClass
-          metadata: { name: wazuh-storage }
-          provisioner: ${PROV}
-          reclaimPolicy: Delete
-          volumeBindingMode: WaitForFirstConsumer
-          allowVolumeExpansion: true
-          EOF
+
+          # 2) Desired spec for wazuh-storage
+          DESIRED_VBM="WaitForFirstConsumer"
+          DESIRED_EXP="true"
+
+          # 3) If wazuh-storage exists, compare critical fields
+          if kubectl get sc wazuh-storage >/dev/null 2>&1; then
+            CUR_PROV="$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}' || true)"
+            CUR_VBM="$(kubectl get sc wazuh-storage -o jsonpath='{.volumeBindingMode}' || true)"
+            CUR_EXP="$(kubectl get sc wazuh-storage -o jsonpath='{.allowVolumeExpansion}' || true)"
+            if [ "$CUR_PROV" != "$PROV" ] || [ "$CUR_VBM" != "$DESIRED_VBM" ] || ! echo "$CUR_EXP" | grep -qi true; then
+              echo "Recreating existing wazuh-storage to match desired settings (immutable fields differ)…"
+              kubectl delete sc wazuh-storage
+            else
+              echo "wazuh-storage already matches desired settings → OK"
+            fi
+          fi
+
+          # 4) Create if absent
+          if ! kubectl get sc wazuh-storage >/dev/null 2>&1; then
+            cat <<EOF | kubectl apply -f -
+            apiVersion: storage.k8s.io/v1
+            kind: StorageClass
+            metadata: { name: wazuh-storage }
+            provisioner: ${PROV}
+            reclaimPolicy: Delete
+            volumeBindingMode: ${DESIRED_VBM}
+            allowVolumeExpansion: ${DESIRED_EXP}
+            EOF
+          fi
+
           kubectl get sc -o wide
 
       - name: Fetch wazuh-kubernetes repo
@@ -165,18 +184,12 @@ jobs:
           IC="${CERTROOT}/indexer_cluster"
           DH="${CERTROOT}/dashboard_http"
           mkdir -p "$IC" "$DH"
-
-          # Root CA
           openssl genrsa -out "$IC/root-ca-key.pem" 4096
           openssl req -x509 -new -key "$IC/root-ca-key.pem" -sha256 -days 3650 -out "$IC/root-ca.pem" -subj "/CN=Wazuh Root CA"
-
-          # Quick leaf certs
           for n in admin node dashboard filebeat; do
             openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
               -keyout "$IC/$n-key.pem" -out "$IC/$n.pem" -subj "/CN=$n"
           done
-
-          # Dashboard TLS
           openssl req -x509 -nodes -days 825 -newkey rsa:2048 \
             -keyout "$DH/key.pem" -out "$DH/cert.pem" -subj "/CN=dashboard"
 
@@ -185,22 +198,13 @@ jobs:
         run: |
           set -e
           kubectl kustomize "wazuh-kubernetes/wazuh" > /tmp/wazuh-all.yaml
-
-          # Drop any StorageClass objects from upstream (we've already created our alias)
+          # Remove any StorageClass objects from upstream
           yq -i 'del(.[] | select(.kind=="StorageClass"))' /tmp/wazuh-all.yaml
-
-          # Single-node: scale Indexer to 1 replica and bump initial PVC sizes
+          # Single node: indexer=1 replica; bump PVC sizes
           yq -i '
-            # replicas: 1 for indexer
             (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer").spec.replicas) = 1 |
-
-            # Indexer PVC -> 60Gi
-            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer")
-              .spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "60Gi" |
-
-            # Manager master PVC -> 20Gi
-            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-manager-master")
-              .spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "20Gi"
+            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer").spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "60Gi" |
+            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-manager-master").spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "20Gi"
           ' /tmp/wazuh-all.yaml
 
       - name: Apply non-StatefulSet resources
