@@ -59,56 +59,43 @@ jobs:
             curl -sSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o "$HOME/bin/kubectl"
             chmod +x "$HOME/bin/kubectl"
           fi
-          kubectl version --client=true | head -n1
           # yq
           if ! command -v yq >/dev/null 2>&1; then
             curl -sSL -o "$HOME/bin/yq" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
             chmod +x "$HOME/bin/yq"
           fi
-          yq --version
           # jq
           if ! command -v jq >/dev/null 2>&1; then
             curl -sSL -o "$HOME/bin/jq" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
             chmod +x "$HOME/bin/jq"
           fi
-          jq --version
 
       - name: Write kubeconfig (supports raw or base64, both names)
         shell: bash
         run: |
           set -euo pipefail
           if [ -n "${RAW_KCFG:-}" ]; then
-            echo "Using RAW kubeconfig (KUBECONFIG)"
             printf '%s' "$RAW_KCFG" > "$KUBECONFIG_PATH"
           elif [ -n "${KCFG_B64_A:-}" ]; then
-            echo "Using base64 kubeconfig (KUBE_CONFIG_B64)"
             printf '%s' "$KCFG_B64_A" | base64 -d > "$KUBECONFIG_PATH"
           elif [ -n "${KCFG_B64_B:-}" ]; then
-            echo "Using base64 kubeconfig (KUBECONFIG_B64)"
             printf '%s' "$KCFG_B64_B" | base64 -d > "$KUBECONFIG_PATH"
           else
-            echo "::error::No kubeconfig secret found. Add KUBECONFIG or KUBE_CONFIG_B64 or KUBECONFIG_B64."
-            exit 1
+            echo "::error::No kubeconfig secret found"; exit 1
           fi
           chmod 600 "$KUBECONFIG_PATH"
           kubectl cluster-info
           kubectl get nodes -o wide
 
       - name: Ensure namespace exists
-        shell: bash
-        run: |
-          kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
+        run: kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Ensure vm.max_map_count via DaemonSet
-        shell: bash
         run: |
           cat > /tmp/wazuh-sysctl-ds.yaml <<'EOF'
           apiVersion: apps/v1
           kind: DaemonSet
-          metadata:
-            name: wazuh-sysctl
-            namespace: kube-system
-            labels: { app: wazuh-sysctl }
+          metadata: { name: wazuh-sysctl, namespace: kube-system, labels: { app: wazuh-sysctl } }
           spec:
             selector: { matchLabels: { app: wazuh-sysctl } }
             template:
@@ -122,169 +109,69 @@ jobs:
                     securityContext: { privileged: true }
                     command: ["/bin/sh","-c"]
                     args:
-                      - |
-                        set -e
-                        echo 262144 > /host-proc/sys/vm/max_map_count
-                        mkdir -p /host-etc/sysctl.d
-                        echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
-                        echo "node: $(hostname) vm.max_map_count=$(cat /host-proc/sys/vm/max_map_count)"
-                        sleep 3600
+                      - echo 262144 > /host-proc/sys/vm/max_map_count; sleep 3600
                     volumeMounts:
                       - { name: host-proc, mountPath: /host-proc }
-                      - { name: host-etc,  mountPath: /host-etc  }
                 volumes:
                   - { name: host-proc, hostPath: { path: /proc, type: Directory } }
-                  - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
-          kubectl -n kube-system get pods -l app=wazuh-sysctl -o wide
 
-      - name: Prepare dynamic StorageClass alias 'wazuh-storage'
-        shell: bash
+      - name: Prepare StorageClass alias
         run: |
           set -euo pipefail
           export PATH="$HOME/bin:$PATH"
-
-          pick_dynamic_sc() {
-            local def dyn
-            def="$(kubectl get sc -o json \
-              | yq -r '.items[]
-                       | select(.provisioner != "kubernetes.io/no-provisioner")
-                       | select(.metadata.annotations."storageclass.kubernetes.io/is-default-class" == "true")
-                       | .metadata.name' | head -n1 || true)"
-            if [ -n "${def:-}" ]; then echo "$def"; return 0; fi
-            dyn="$(kubectl get sc -o json \
-              | yq -r '.items[]
-                       | select(.provisioner != "kubernetes.io/no-provisioner")
-                       | .metadata.name' | head -n1 || true)"
-            [ -n "${dyn:-}" ] && echo "$dyn"
-          }
-
-          TARGET_SC="$(pick_dynamic_sc || true)"
-          if [ -z "${TARGET_SC:-}" ]; then
-            echo "No dynamic StorageClass found. Installing local-path-provisioner …"
-            kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
-            kubectl -n local-path-storage rollout status deploy/local-path-provisioner --timeout=180s
-            kubectl annotate sc local-path storageclass.kubernetes.io/is-default-class="true" --overwrite || true
-            TARGET_SC="local-path"
-          fi
-
+          TARGET_SC="$(kubectl get sc -o json | yq -r '.items[] | select(.metadata.annotations."storageclass.kubernetes.io/is-default-class"=="true") | .metadata.name' | head -n1 || true)"
+          [ -z "$TARGET_SC" ] && TARGET_SC="local-path"
           PROV="$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')"
-
           cat <<EOF | kubectl apply -f -
           apiVersion: storage.k8s.io/v1
           kind: StorageClass
-          metadata:
-            name: wazuh-storage
+          metadata: { name: wazuh-storage }
           provisioner: ${PROV}
           reclaimPolicy: Delete
           volumeBindingMode: WaitForFirstConsumer
           allowVolumeExpansion: true
           EOF
 
-          kubectl get sc -o wide
+      - name: Fetch wazuh-kubernetes repo
+        run: git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
 
-      - name: Fetch official wazuh-kubernetes repo
-        shell: bash
+      - name: Generate self-signed certs (indexer/dashboard)
         run: |
           set -e
-          rm -rf wazuh-kubernetes
-          git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
-
-      - name: Resolve overlay path
-        id: resolve
-        shell: bash
-        run: |
-          set -euo pipefail
-          ROOT="wazuh-kubernetes/wazuh"
-          if [ -f "$ROOT/kustomization.yml" ] || [ -f "$ROOT/kustomization.yaml" ]; then
-            PICK="$ROOT"
-          else
-            PICK="$(find "$ROOT" -type f \( -name 'kustomization.yml' -o -name 'kustomization.yaml' \) -printf '%h\n' | sort -u | head -n1 || true)"
-          fi
-          test -n "${PICK:-}" || { echo "::error::No kustomize overlay under $ROOT"; exit 1; }
-          echo "overlay_path=$PICK" >> "$GITHUB_OUTPUT"
+          CERTROOT="wazuh-kubernetes/wazuh/certs"
+          mkdir -p "$CERTROOT/indexer_cluster" "$CERTROOT/dashboard_http"
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout "$CERTROOT/indexer_cluster/root-ca-key.pem" -out "$CERTROOT/indexer_cluster/root-ca.pem" -subj "/CN=wazuh-root"
+          # quick dummy certs for demo – extend if needed
+          for n in admin node dashboard filebeat; do
+            openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout "$CERTROOT/indexer_cluster/$n-key.pem" -out "$CERTROOT/indexer_cluster/$n.pem" -subj "/CN=$n"
+          done
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout "$CERTROOT/dashboard_http/key.pem" -out "$CERTROOT/dashboard_http/cert.pem" -subj "/CN=dashboard"
 
       - name: Build overlay (yaml)
-        shell: bash
         run: |
           export PATH="$HOME/bin:$PATH"
-          kubectl kustomize "${{ steps.resolve.outputs.overlay_path }}" > /tmp/wazuh-all.yaml
-          # Remove any StorageClass objects from the bundle (we already created alias)
-          yq -i 'del( .[] | select(.kind=="StorageClass") )' /tmp/wazuh-all.yaml
-          # Bump some default PVC sizes before apply
+          kubectl kustomize "wazuh-kubernetes/wazuh" > /tmp/wazuh-all.yaml
+          yq -i 'del(.[] | select(.kind=="StorageClass"))' /tmp/wazuh-all.yaml
           yq -i '
-            # Indexer (StatefulSet) -> 60Gi
-            ( .[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer")
-                .spec.volumeClaimTemplates[]? ) |=
-              (.spec.resources.requests.storage = "60Gi")
-            |
-            # Manager master -> 20Gi
-            ( .[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-manager-master")
-                .spec.volumeClaimTemplates[]? ) |=
-              (.spec.resources.requests.storage = "20Gi")
+            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer").spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "60Gi" |
+            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-manager-master").spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "20Gi"
           ' /tmp/wazuh-all.yaml
 
-      - name: Apply non-StatefulSet resources first
-        shell: bash
+      - name: Apply non-StatefulSet resources
         run: |
-          set -e
-          export PATH="$HOME/bin:$PATH"
-          yq -o=y e 'select(.kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-non-sts.yaml
-          if [ -s /tmp/wazuh-non-sts.yaml ]; then kubectl -n "$NS" apply -f /tmp/wazuh-non-sts.yaml; fi
+          yq -o=y e 'select(.kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/non-sts.yaml
+          kubectl -n "$NS" apply -f /tmp/non-sts.yaml || true
 
-      - name: Recreate & apply StatefulSets (immutability-safe)
-        shell: bash
+      - name: Apply StatefulSets
         run: |
-          set -e
-          export PATH="$HOME/bin:$PATH"
-          # delete if exist to avoid immutable changes (e.g., PVC template)
-          for n in wazuh-indexer wazuh-manager-master wazuh-manager-worker wazuh-manager-worker-0 wazuh-manager-worker-1; do
-            kubectl -n "$NS" delete statefulset "$n" --ignore-not-found=true
-          done
-          yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/wazuh-sts.yaml
-          kubectl -n "$NS" apply -f /tmp/wazuh-sts.yaml
+          yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/sts.yaml
+          kubectl -n "$NS" apply -f /tmp/sts.yaml
 
-      - name: Wait for core components
-        shell: bash
+      - name: Wait for core
         run: |
-          set -e
           for sel in "app=wazuh-indexer" "app=wazuh-manager" "app=wazuh-dashboard"; do
-            echo "Waiting for: $sel"
             kubectl -n "$NS" wait --for=condition=Ready pod -l "$sel" --timeout=1200s || true
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
-
-      - name: Discover dashboard port
-        id: dash
-        shell: bash
-        run: |
-          set -euo pipefail
-          P="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
-          if [ -z "${P:-}" ]; then
-            P="$(kubectl -n "$NS" get deploy wazuh-dashboard -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || true)"
-          fi
-          test -n "${P:-}" || { echo "::error::Could not find dashboard port"; exit 1; }
-          echo "port=$P" >> "$GITHUB_OUTPUT"
-
-      - name: Optional port-forward to dashboard
-        if: ${{ inputs.enable_port_forward == 'true' }}
-        shell: bash
-        env:
-          PF_BIND: 127.0.0.1
-          PF_PORT: ${{ inputs.local_forward_port }}
-        run: |
-          set -euo pipefail
-          TARGET_PORT="${{ steps.dash.outputs.port }}"
-          (pkill -f "port-forward .*:${PF_PORT}:" && sleep 1) || true
-          nohup kubectl -n "$NS" port-forward --address "${PF_BIND}" deploy/wazuh-dashboard "${PF_PORT}:${TARGET_PORT}" > portforward.log 2>&1 &
-          echo "::notice title=Browse Dashboard::http://localhost:${PF_PORT}"
-
-      - name: Final status
-        shell: bash
-        run: |
-          kubectl get sc -o wide
-          kubectl -n "$NS" get pvc
-          kubectl -n "$NS" get svc -o wide
-          kubectl -n "$NS" get endpoints -o wide
-          kubectl -n "$NS" get pods -o wide
