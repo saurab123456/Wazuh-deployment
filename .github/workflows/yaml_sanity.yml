@@ -5,23 +5,21 @@ on:
   push:
     branches: ["main"]
 
-# This job runs on your Ronin self-hosted runner
 jobs:
   sanity:
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
     timeout-minutes: 60
 
-    # Map secrets into env FIRST (this is the safe way to use them in bash)
     env:
       KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
-      RAW_KCFG: ${{ secrets.KUBECONFIG }}         # plain kubeconfig (recommended)
-      KCFG_B64: ${{ secrets.KUBECONFIG_B64 }}     # base64 version (optional)
+      RAW_KCFG: ${{ secrets.KUBECONFIG }}
+      KCFG_B64: ${{ secrets.KUBECONFIG_B64 }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Mask secrets (avoid leaking in logs)
+      - name: Mask secrets
         shell: bash
         run: |
           if [ -n "${RAW_KCFG:-}" ]; then
@@ -43,7 +41,6 @@ jobs:
           fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # ✅ CORRECT secret usage — note the ${{ ... }} only in env above, not here.
       - name: Write kubeconfig from secrets
         shell: bash
         run: |
@@ -55,7 +52,7 @@ jobs:
             echo "Using base64 kubeconfig from secret KUBECONFIG_B64"
             printf '%s' "$KCFG_B64" | base64 -d > "$KUBECONFIG_PATH"
           else
-            echo "::error::No kubeconfig found. Please set KUBECONFIG (raw) or KUBECONFIG_B64."
+            echo "::error::No kubeconfig secret found"
             exit 1
           fi
           chmod 600 "$KUBECONFIG_PATH"
@@ -66,5 +63,7 @@ jobs:
           KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
         run: |
           set -euo pipefail
-          kubectl version --short
+          echo "== kubectl client version =="
+          kubectl version
+          echo "== Cluster nodes =="
           kubectl get nodes -o wide
