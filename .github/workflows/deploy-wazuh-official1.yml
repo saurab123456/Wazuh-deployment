@@ -72,6 +72,16 @@ jobs:
           fi
           yq --version
 
+      - name: Install jq
+        shell: bash
+        run: |
+          set -e
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
+          jq --version
+
       - name: Write kubeconfig from secret
         shell: bash
         env:
@@ -130,7 +140,7 @@ jobs:
             kubectl -n kube-system logs "$p" || true
           done
 
-      # ---------- ROBUST: guarantee a dynamic SC and alias it as 'wazuh-storage' ----------
+      # ---------- dynamic StorageClass alias ----------
       - name: Ensure StorageClass alias 'wazuh-storage'
         shell: bash
         run: |
@@ -253,7 +263,7 @@ jobs:
           kubectl kustomize "${{ steps.resolve.outputs.overlay_path }}" > /tmp/wazuh-all.yaml
           kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
-      # --- FIXED: only touch ConfigMaps that actually contain data.ossec.conf ---
+      # --- ONLY touch ConfigMaps that actually contain data.ossec.conf ---
       - name: Enforce passwordless <auth> in manager ConfigMaps (pre-apply)
         shell: bash
         run: |
@@ -368,6 +378,152 @@ jobs:
                         rm -f /var/ossec/etc/authd.pass || true
             ' || true
           done
+
+      # -------------------- TUNE: requests-only + JVM + spread + PVC sizes --------------------
+      - name: Tune indexers for burst (requests-only), JVM & spreading
+        shell: bash
+        run: |
+          set -euo pipefail
+          # JVM / fsGroup / anti-affinity / topology spread / requests-only
+          kubectl -n "$NS" patch sts wazuh-indexer --type=merge -p '{
+            "spec": {
+              "template": {
+                "metadata": { "labels": { "app": "wazuh-indexer" } },
+                "spec": {
+                  "securityContext": { "runAsUser": 1000, "runAsGroup": 1000, "fsGroup": 1000 },
+                  "containers": [{
+                    "name": "wazuh-indexer",
+                    "env": [
+                      { "name": "OPENSEARCH_JAVA_OPTS", "value": "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=256m -Dlog4j2.formatMsgNoLookups=true" }
+                    ],
+                    "resources": { "requests": { "cpu": "1", "memory": "2Gi" } }
+                  }],
+                  "affinity": {
+                    "podAntiAffinity": {
+                      "preferredDuringSchedulingIgnoredDuringExecution": [{
+                        "weight": 100,
+                        "podAffinityTerm": {
+                          "labelSelector": { "matchLabels": { "app": "wazuh-indexer" } },
+                          "topologyKey": "kubernetes.io/hostname"
+                        }
+                      }]
+                    }
+                  },
+                  "topologySpreadConstraints": [{
+                    "maxSkew": 1,
+                    "topologyKey": "kubernetes.io/hostname",
+                    "whenUnsatisfiable": "ScheduleAnyway",
+                    "labelSelector": { "matchLabels": { "app": "wazuh-indexer" } }
+                  }]
+                }
+              }
+            }
+          }'
+          # Remove limits if present
+          kubectl -n "$NS" patch statefulset wazuh-indexer --type='json' -p='[
+            {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
+          ]' 2>/dev/null || true
+
+      - name: Tune managers & dashboard (requests-only, no limits)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Manager master
+          if kubectl -n "$NS" get sts wazuh-manager-master >/dev/null 2>&1; then
+            kubectl -n "$NS" patch sts wazuh-manager-master --type=merge -p '{
+              "spec": { "template": { "spec": { "containers": [{
+                "name": "wazuh-manager",
+                "resources": { "requests": { "cpu": "500m", "memory": "1536Mi" } }
+              }]}}}
+            }'
+            kubectl -n "$NS" patch statefulset wazuh-manager-master --type='json' -p='[
+              {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
+            ]' 2>/dev/null || true
+          fi
+          # Manager workers (single STS or numbered)
+          if kubectl -n "$NS" get sts wazuh-manager-worker >/dev/null 2>&1; then
+            kubectl -n "$NS" patch sts wazuh-manager-worker --type=merge -p '{
+              "spec": { "template": { "spec": { "containers": [{
+                "name": "wazuh-manager",
+                "resources": { "requests": { "cpu": "500m", "memory": "1Gi" } }
+              }]}}}
+            }' || true
+            kubectl -n "$NS" patch statefulset wazuh-manager-worker --type='json' -p='[
+              {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
+            ]' 2>/dev/null || true
+          else
+            for st in wazuh-manager-worker-0 wazuh-manager-worker-1; do
+              kubectl -n "$NS" patch sts "$st" --type=merge -p '{
+                "spec": { "template": { "spec": { "containers": [{
+                  "name": "wazuh-manager",
+                  "resources": { "requests": { "cpu": "500m", "memory": "1Gi" } }
+                }]}}}
+              }' 2>/dev/null || true
+              kubectl -n "$NS" patch statefulset "$st" --type='json' -p='[
+                {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
+              ]' 2>/dev/null || true
+            done
+          fi
+          # Dashboard
+          if kubectl -n "$NS" get deploy wazuh-dashboard >/dev/null 2>&1; then
+            kubectl -n "$NS" patch deploy wazuh-dashboard --type=merge -p '{
+              "spec": { "template": { "spec": { "containers": [{
+                "name": "wazuh-dashboard",
+                "resources": { "requests": { "cpu": "200m", "memory": "512Mi" } }
+              }]}}}
+            }'
+            kubectl -n "$NS" patch deploy wazuh-dashboard --type='json' -p='[
+              {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
+            ]' 2>/dev/null || true
+          fi
+
+      - name: Resize PVCs (Indexer→30Gi, Manager master→15Gi, Dashboard→10Gi)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          supports_expansion () {
+            local pvc="$1"
+            local sc
+            sc="$(kubectl -n "$NS" get pvc "$pvc" -o jsonpath='{.spec.storageClassName}' 2>/dev/null || true)"
+            [ -z "$sc" ] && { echo "no"; return; }
+            kubectl get sc "$sc" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null | grep -qi true && echo "yes" || echo "no"
+          }
+
+          resize_pvc () {
+            local pvc="$1" newsize="$2"
+            kubectl -n "$NS" get pvc "$pvc" >/dev/null 2>&1 || { echo "::warning::PVC $pvc not found"; return; }
+            local ok; ok="$(supports_expansion "$pvc")"
+            if [ "$ok" != "yes" ]; then
+              echo "::error::StorageClass for PVC $pvc does not allow expansion. Scale down & recreate to $newsize."
+              return
+            fi
+            echo "Resizing $pvc -> $newsize"
+            kubectl -n "$NS" patch pvc "$pvc" --type=merge -p "{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"$newsize\"}}}}"
+          }
+
+          # Indexers (standard claim names from manifest template)
+          for i in 0 1 2; do
+            resize_pvc "wazuh-indexer-wazuh-indexer-$i" "30Gi" || true
+          done
+
+          # Manager master (discover PVCs from pod)
+          if kubectl -n "$NS" get pod wazuh-manager-master-0 >/dev/null 2>&1; then
+            mapfile -t MM_PVCS < <(kubectl -n "$NS" get pod wazuh-manager-master-0 -o json \
+              | jq -r '.spec.volumes[] | select(.persistentVolumeClaim) | .persistentVolumeClaim.claimName')
+            for pvc in "${MM_PVCS[@]:-}"; do resize_pvc "$pvc" "15Gi"; done
+          fi
+
+          # Dashboard (discover pod + PVCs)
+          DASH_POD="$(kubectl -n "$NS" get pods -l app=wazuh-dashboard -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+          if [ -n "${DASH_POD:-}" ]; then
+            mapfile -t DASH_PVCS < <(kubectl -n "$NS" get pod "$DASH_POD" -o json \
+              | jq -r '.spec.volumes[] | select(.persistentVolumeClaim) | .persistentVolumeClaim.claimName')
+            for pvc in "${DASH_PVCS[@]:-}"; do resize_pvc "$pvc" "10Gi"; done
+          fi
+
+          echo "PVCs after resize request:"
+          kubectl -n "$NS" get pvc
 
       - name: Wait & diagnose core components
         shell: bash
@@ -535,7 +691,7 @@ jobs:
           EOF
           kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
 
-      - name: Deploy Agent DaemonSet (agent-auth without -P)
+      - name: Deploy Agent DaemonSet (requests-only, no limits)
         shell: bash
         run: |
           set -euo pipefail
@@ -623,7 +779,6 @@ jobs:
                         exec: { command: ["/bin/sh","-c","/var/ossec/bin/wazuh-control stop || true"] }
                     resources:
                       requests: { cpu: "100m", memory: "256Mi" }
-                      limits:   { cpu: "1000m", memory: "1024Mi" }
                     volumeMounts:
                       - { name: ossec-conf-cm,   mountPath: /config,                    readOnly: true }
                       - { name: varlogcontainers, mountPath: /host/var/log/containers,   readOnly: true }
@@ -691,6 +846,8 @@ jobs:
       - name: Final status
         shell: bash
         run: |
+          kubectl -n "$NS" get sc -o wide
+          kubectl -n "$NS" get pvc
           kubectl -n "$NS" get svc -o wide
           kubectl -n "$NS" get endpoints -o wide
           kubectl -n "$NS" get pods -o wide
