@@ -5,7 +5,8 @@ on:
 
 jobs:
   probe:
-    runs-on: [self-hosted, ronin, k8s, control-plane, vmware]
+    # Match your runner's labels exactly
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
 
     env:
       KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
@@ -16,21 +17,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure tools (kubectl, yq, nc)
+      - name: Ensure tools (kubectl, yq, nc) without sudo
         shell: bash
         run: |
           set -euo pipefail
+
+          BIN="$HOME/bin"
+          mkdir -p "$BIN"
+          echo "$BIN" >> "$GITHUB_PATH"
+
+          # kubectl
           if ! command -v kubectl >/dev/null 2>&1; then
             VER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
-            curl -fsSL -o kubectl "https://dl.k8s.io/release/${VER}/bin/linux/amd64/kubectl"
-            chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+            curl -fsSL -o "$BIN/kubectl" "https://dl.k8s.io/release/${VER}/bin/linux/amd64/kubectl"
+            chmod +x "$BIN/kubectl"
           fi
+
+          # yq
           if ! command -v yq >/dev/null 2>&1; then
-            curl -fsSL -o yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
-            chmod +x yq && sudo mv yq /usr/local/bin/yq
+            curl -fsSL -o "$BIN/yq" https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x "$BIN/yq"
           fi
-          sudo apt-get update -y >/dev/null 2>&1 || true
-          sudo apt-get install -y --no-install-recommends netcat-openbsd >/dev/null 2>&1 || true
+
+          # netcat (allowed via sudoers: apt-get)
+          sudo -n apt-get update -y >/dev/null 2>&1 || true
+          sudo -n apt-get install -y --no-install-recommends netcat-openbsd >/dev/null 2>&1 || true
+
           kubectl version --client=true | head -n1
           yq --version
 
@@ -39,9 +51,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${KCFG_NEW:-}" ]; then
-            echo "$KCFG_NEW" | base64 -d > "$KUBECONFIG"
+            printf '%s' "$KCFG_NEW" | base64 -d > "$KUBECONFIG"
           elif [ -n "${KCFG_OLD:-}" ]; then
-            echo "$KCFG_OLD" | base64 -d > "$KUBECONFIG"
+            printf '%s' "$KCFG_OLD" | base64 -d > "$KUBECONFIG"
           else
             echo "::error::No kubeconfig secret provided"; exit 1
           fi
@@ -55,15 +67,14 @@ jobs:
           set -euo pipefail
 
           get_host_port () {
-            local url="$1"
-            local host port
+            local url="$1" host port
             host="$(echo "$url" | sed -E 's#^https?://([^:/]+).*#\1#')"
             port="$(echo "$url" | sed -nE 's#^https?://[^:/]+:([0-9]+).*#\1#p')"
             echo "${host} ${port:-6443}"
           }
 
           norm_url () { # -> https://host:port
-            local s="$(echo "$1" | xargs)"
+            local s; s="$(echo "$1" | xargs)"
             [ -z "$s" ] && { echo ""; return; }
             if [[ "$s" =~ ^https?:// ]]; then echo "$s";
             elif [[ "$s" =~ :[0-9]+$ ]]; then echo "https://$s";
@@ -71,8 +82,7 @@ jobs:
           }
 
           try_url () {
-            local url="$1"
-            read host port < <(get_host_port "$url")
+            local url="$1"; read host port < <(get_host_port "$url")
             echo "Probing ${host}:${port} …"
             if nc -zv -w3 "$host" "$port"; then
               echo "Updating kubeconfig to: $url"
