@@ -156,7 +156,7 @@ jobs:
             -out "$DH/cert.pem" -days 825 -sha256 -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
           rm -f "$DH/dashboard.csr"
 
-      # Build overlay (core only), filter out StorageClass; no yq 'if' mutations
+      # Build overlay (core only), filter out StorageClass
       - name: Build overlay (core only; no StorageClass)
         shell: bash
         run: |
@@ -168,30 +168,77 @@ jobs:
           yq -o=y e 'select(.kind != "StatefulSet")' /tmp/_base.yaml > /tmp/non-sts.yaml
           yq -o=y e 'select(.kind == "StatefulSet")' /tmp/_base.yaml > /tmp/sts.yaml
           # Avoid dashboard replace conflicts when re-running
-          kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true
+          kubectl --namespace="$NS" delete deploy wazuh-dashboard --ignore-not-found=true
 
       - name: Apply non-StatefulSet resources
         shell: bash
         run: |
           set -e
-          if [ -s /tmp/non-sts.yaml ]; then kubectl -n "$NS" apply -f /tmp/non-sts.yaml; fi
+          if [ -s /tmp/non-sts.yaml ]; then kubectl --namespace="$NS" apply -f /tmp/non-sts.yaml; fi
 
       - name: Recreate core StatefulSets and apply
         shell: bash
         run: |
           set -e
           for n in wazuh-manager-master wazuh-manager-worker wazuh-indexer; do
-            kubectl -n "$NS" delete statefulset "$n" --ignore-not-found=true
+            kubectl --namespace="$NS" delete statefulset "$n" --ignore-not-found=true
           done
-          kubectl -n "$NS" apply -f /tmp/sts.yaml
+          kubectl --namespace="$NS" apply -f /tmp/sts.yaml
 
-      # Guardrails: set image and replicas via kubectl (no risky YAML mutations)
+      # Guardrails: set image and replicas via kubectl (use long --namespace to avoid -n parsing issues)
       - name: Enforce wazuh-indexer image+replicas and worker replicas
         shell: bash
         run: |
           set -euo pipefail
           TAG_NO_V="${WAZUH_K8S_TAG#v}"
-          kubectl -n "$NS" get sts wazuh-indexer >/dev/null 2>&1 || { echo "::error::Missing StatefulSet wazuh-indexer"; exit 1; }
-          kubectl -n "$NS" set image statefulset/wazuh-indexer wazuh-indexer=wazuh/wazuh-indexer:${TAG_NO_V}
-          kubectl -n "$NS" scale statefulset/wazuh-indexer --replicas=1
-          kubectl -n
+          kubectl --namespace="$NS" get sts wazuh-indexer >/dev/null 2>&1 || { echo "::error::Missing StatefulSet wazuh-indexer"; exit 1; }
+          kubectl --namespace="$NS" set image statefulset/wazuh-indexer wazuh-indexer=wazuh/wazuh-indexer:${TAG_NO_V}
+          kubectl --namespace="$NS" scale statefulset/wazuh-indexer --replicas=1
+          # scale worker only if it exists
+          if kubectl --namespace="$NS" get sts wazuh-manager-worker >/dev/null 2>&1; then
+            kubectl --namespace="$NS" scale statefulset/wazuh-manager-worker --replicas=1
+          fi
+          IMG="$(kubectl --namespace="$NS" get sts wazuh-indexer -o jsonpath='{.spec.template.spec.containers[0].image}')"
+          [ -n "$IMG" ] || { echo "::error::Indexer image is empty"; exit 1; }
+          echo "Indexer image: $IMG"
+
+      - name: Wait for core to be Ready
+        shell: bash
+        run: |
+          set -e
+          for sel in "app=wazuh-indexer" "app=wazuh-manager" "app=wazuh-dashboard"; do
+            echo "Waiting for: $sel"
+            kubectl --namespace="$NS" wait --for=condition=Ready pod -l "$sel" --timeout=1200s || true
+            kubectl --namespace="$NS" get pods -l "$sel" -o wide
+          done
+
+      - name: Discover Dashboard port
+        id: dash
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="$(kubectl --namespace="$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
+          if [ -z "${PORT:-}" ]; then
+            PORT="$(kubectl --namespace="$NS" get deploy wazuh-dashboard -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || true)"
+          fi
+          test -n "${PORT:-}" || { echo "::error::Could not determine dashboard port"; exit 1; }
+          echo "dash_port=${PORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Start Dashboard port-forward (optional)
+        if: ${{ inputs.enable_port_forward == 'true' }}
+        shell: bash
+        env:
+          PF_BIND: 127.0.0.1
+          PF_PORT: ${{ inputs.local_forward_port }}
+        run: |
+          set -euo pipefail
+          TARGET_PORT="${{ steps.dash.outputs.dash_port }}"
+          (pkill -f "port-forward .*:${PF_PORT}:" && sleep 1) || true
+          nohup kubectl --namespace="$NS" port-forward --address "${PF_BIND}" deploy/wazuh-dashboard "${PF_PORT}:${TARGET_PORT}" > portforward.log 2>&1 &
+          echo "::notice title=Browse Now::Open http://localhost:${PF_PORT}"
+
+      - name: Final status
+        shell: bash
+        run: |
+          kubectl --namespace="$NS" get svc -o wide
+          kubectl --namespace="$NS" get pods -o wide
