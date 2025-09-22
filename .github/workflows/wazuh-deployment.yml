@@ -71,25 +71,18 @@ jobs:
           metadata:
             name: wazuh-sysctl
             namespace: kube-system
-            labels:
-              app: wazuh-sysctl
+            labels: { app: wazuh-sysctl }
           spec:
-            selector:
-              matchLabels:
-                app: wazuh-sysctl
+            selector: { matchLabels: { app: wazuh-sysctl } }
             template:
-              metadata:
-                labels:
-                  app: wazuh-sysctl
+              metadata: { labels: { app: wazuh-sysctl } }
               spec:
                 hostPID: true
-                tolerations:
-                  - operator: Exists
+                tolerations: [ {operator: Exists} ]
                 containers:
                   - name: sysctl
                     image: busybox:1.36
-                    securityContext:
-                      privileged: true
+                    securityContext: { privileged: true }
                     command: ["/bin/sh","-c"]
                     args:
                       - |
@@ -99,15 +92,11 @@ jobs:
                         echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
                         sleep 3600
                     volumeMounts:
-                      - name: host-proc
-                        mountPath: /host-proc
-                      - name: host-etc
-                        mountPath: /host-etc
+                      - { name: host-proc, mountPath: /host-proc }
+                      - { name: host-etc,  mountPath: /host-etc  }
                 volumes:
-                  - name: host-proc
-                    hostPath: { path: /proc, type: Directory }
-                  - name: host-etc
-                    hostPath: { path: /etc,  type: Directory }
+                  - { name: host-proc, hostPath: { path: /proc, type: Directory } }
+                  - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
           EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
 
@@ -118,15 +107,70 @@ jobs:
           rm -rf wazuh-kubernetes
           git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
 
+      # *** FIX for your failure: create the cert files Kustomize expects ***
+      - name: Generate self-signed certs (indexer cluster + dashboard)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CERTROOT="$GITHUB_WORKSPACE/wazuh-kubernetes/wazuh/certs"
+          IC="$CERTROOT/indexer_cluster"
+          DH="$CERTROOT/dashboard_http"
+          mkdir -p "$IC" "$DH"
+
+          cat > /tmp/wazuh-openssl.cnf <<'CONF'
+          [req]
+          default_bits=2048
+          prompt=no
+          default_md=sha256
+          req_extensions = v3_req
+          distinguished_name=req_dn
+          [req_dn]
+          CN=wazuh-local
+          [v3_req]
+          basicConstraints = CA:FALSE
+          keyUsage = digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth, clientAuth
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = wazuh-indexer
+          DNS.2 = wazuh-indexer.wazuh.svc
+          DNS.3 = wazuh-dashboard
+          DNS.4 = wazuh-dashboard.wazuh.svc
+          DNS.5 = localhost
+          IP.1  = 127.0.0.1
+          CONF
+
+          # Root CA
+          openssl genrsa -out "$IC/root-ca-key.pem" 4096
+          openssl req -x509 -new -key "$IC/root-ca-key.pem" -sha256 -days 3650 \
+            -out "$IC/root-ca.pem" -subj "/CN=Wazuh Root CA"
+
+          sign_ic () {
+            local name="$1"
+            openssl genrsa -out "$IC/${name}-key.pem" 2048
+            openssl req -new -key "$IC/${name}-key.pem" -out "$IC/${name}.csr" -config /tmp/wazuh-openssl.cnf
+            openssl x509 -req -in "$IC/${name}.csr" -CA "$IC/root-ca.pem" -CAkey "$IC/root-ca-key.pem" \
+              -CAcreateserial -out "$IC/${name}.pem" -days 825 -sha256 \
+              -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
+            rm -f "$IC/${name}.csr"
+          }
+          for n in admin node dashboard filebeat; do sign_ic "$n"; done
+
+          # Dashboard HTTPS cert
+          openssl genrsa -out "$DH/key.pem" 2048
+          openssl req -new -key "$DH/key.pem" -out "$DH/dashboard.csr" -config /tmp/wazuh-openssl.cnf
+          openssl x509 -req -in "$DH/dashboard.csr" -CA "$IC/root-ca.pem" -CAkey "$IC/root-ca-key.pem" \
+            -CAcreateserial -out "$DH/cert.pem" -days 825 -sha256 \
+            -extensions v3_req -extfile /tmp/wazuh-openssl.cnf
+          rm -f "$DH/dashboard.csr"
+
       - name: Build overlay (drop StorageClass; 1 indexer & 1 worker)
         shell: bash
         run: |
           set -e
           kubectl kustomize "$GITHUB_WORKSPACE/wazuh-kubernetes/wazuh" > /tmp/wazuh-all.yaml
-          # strip any StorageClass objects
           yq 'select(.kind != "StorageClass")' /tmp/wazuh-all.yaml > /tmp/wazuh-all.nosc.yaml
           mv /tmp/wazuh-all.nosc.yaml /tmp/wazuh-all.yaml
-          # ensure single replicas
           yq -i '
             (select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer").spec.replicas) = 1 |
             (select(.kind=="StatefulSet" and .metadata.name=="wazuh-manager-worker").spec.replicas) = 1
@@ -153,11 +197,9 @@ jobs:
           set -euo pipefail
           TAG_NO_V="${WAZUH_K8S_TAG#v}"
 
-          # Make sure indexer has the image & 1Gi heap
           kubectl -n "$NS" set image statefulset/wazuh-indexer wazuh-indexer="wazuh/wazuh-indexer:${TAG_NO_V}"
           kubectl -n "$NS" set env statefulset/wazuh-indexer OPENSEARCH_JAVA_OPTS="-Xms1g -Xmx1g -Dlog4j2.formatMsgNoLookups=true"
 
-          # Remove limits everywhere and set modest requests
           kubectl -n "$NS" set resources statefulset/wazuh-indexer \
             --containers=wazuh-indexer --requests=cpu=500m,memory=1500Mi --limits=
           kubectl -n "$NS" patch statefulset/wazuh-indexer --type=json -p='[
@@ -178,7 +220,6 @@ jobs:
             {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
           ]' || true
 
-          # Restart to pick changes immediately
           kubectl -n "$NS" rollout restart statefulset/wazuh-indexer
           kubectl -n "$NS" rollout restart statefulset/wazuh-manager-master
           kubectl -n "$NS" rollout restart statefulset/wazuh-manager-worker
