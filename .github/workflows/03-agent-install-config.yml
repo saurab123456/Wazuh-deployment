@@ -8,8 +8,17 @@ on:
         required: true
         default: "kubernetes"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   agent:
+    # Hard guard: run ONLY when manually dispatched
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
     timeout-minutes: 60
     env:
@@ -105,8 +114,7 @@ jobs:
                         value: "1515"
                       - name: MANAGER_DNS
                         value: "wazuh-authd-master.wazuh.svc.cluster.local"
-                      - name: GROUPS
-                        valueFrom: { configMapKeyRef: { name: wazuh-agent-ossec, key: dummy, optional: true } }
+                      # GROUPS comes from the pod env; script defaults to kubernetes if empty
                     command: ["/bin/sh","-c"]
                     args:
                       - |
