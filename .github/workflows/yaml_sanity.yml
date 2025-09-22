@@ -5,8 +5,8 @@ on:
 
 jobs:
   probe:
-    # Match your runner's labels exactly
-    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
+    # keep vmware only if your runner has that label (it looks like it does)
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane, vmware]
 
     env:
       KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
@@ -17,13 +17,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure tools (kubectl, yq, nc) without sudo
+      - name: Ensure tools (kubectl, yq, nc) without sudo to /home/actions/bin
         shell: bash
         run: |
           set -euo pipefail
 
           BIN="$HOME/bin"
           mkdir -p "$BIN"
+          # make it available both now and for later steps
+          export PATH="$BIN:$PATH"
           echo "$BIN" >> "$GITHUB_PATH"
 
           # kubectl
@@ -35,11 +37,12 @@ jobs:
 
           # yq
           if ! command -v yq >/dev/null 2>&1; then
-            curl -fsSL -o "$BIN/yq" https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            curl -fsSL -o "$BIN/yq" \
+              https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
             chmod +x "$BIN/yq"
           fi
 
-          # netcat (allowed via sudoers: apt-get)
+          # netcat (sudo apt-get is whitelisted in your sudoers)
           sudo -n apt-get update -y >/dev/null 2>&1 || true
           sudo -n apt-get install -y --no-install-recommends netcat-openbsd >/dev/null 2>&1 || true
 
@@ -73,7 +76,7 @@ jobs:
             echo "${host} ${port:-6443}"
           }
 
-          norm_url () { # -> https://host:port
+          norm_url () {
             local s; s="$(echo "$1" | xargs)"
             [ -z "$s" ] && { echo ""; return; }
             if [[ "$s" =~ ^https?:// ]]; then echo "$s";
