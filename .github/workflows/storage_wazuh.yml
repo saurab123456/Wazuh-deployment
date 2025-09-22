@@ -1,4 +1,4 @@
-name: 01) Wazuh — Storage + Core (single-node)
+name: 01) Wazuh - Storage + Core (single-node)
 
 on:
   workflow_dispatch:
@@ -85,24 +85,32 @@ jobs:
       - name: Ensure vm.max_map_count via DaemonSet
         shell: bash
         run: |
-          cat > /tmp/wazuh-sysctl-ds.yaml <<'YAML'
+          set -euo pipefail
+          cat >/tmp/wazuh-sysctl-ds.yaml <<'EOF'
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: wazuh-sysctl
   namespace: kube-system
-  labels: { app: wazuh-sysctl }
+  labels:
+    app: wazuh-sysctl
 spec:
-  selector: { matchLabels: { app: wazuh-sysctl } }
+  selector:
+    matchLabels:
+      app: wazuh-sysctl
   template:
-    metadata: { labels: { app: wazuh-sysctl } }
+    metadata:
+      labels:
+        app: wazuh-sysctl
     spec:
       hostPID: true
-      tolerations: [ { operator: "Exists" } ]
+      tolerations:
+        - operator: "Exists"
       containers:
         - name: sysctl
           image: busybox:1.36
-          securityContext: { privileged: true }
+          securityContext:
+            privileged: true
           command: ["/bin/sh","-c"]
           args:
             - |
@@ -110,14 +118,23 @@ spec:
               echo 262144 > /host-proc/sys/vm/max_map_count
               mkdir -p /host-etc/sysctl.d
               echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
+              echo "node: $(hostname) vm.max_map_count=$(cat /host-proc/sys/vm/max_map_count)"
               sleep 3600
           volumeMounts:
-            - { name: host-proc, mountPath: /host-proc }
-            - { name: host-etc,  mountPath: /host-etc  }
+            - name: host-proc
+              mountPath: /host-proc
+            - name: host-etc
+              mountPath: /host-etc
       volumes:
-        - { name: host-proc, hostPath: { path: /proc, type: Directory } }
-        - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
-YAML
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: host-etc
+          hostPath:
+            path: /etc
+            type: Directory
+EOF
           kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
 
       - name: Prepare StorageClass alias 'wazuh-storage' (safe replace)
@@ -148,7 +165,7 @@ YAML
           fi
 
           if [ "$NEED_CREATE" = "true" ]; then
-            cat <<EOF >/tmp/wazuh-sc.yaml
+            cat >/tmp/wazuh-sc.yaml <<EOF
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata:
@@ -171,7 +188,7 @@ EOF
       - name: Generate self-signed certs (indexer + dashboard)
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           CERTROOT="${{ github.workspace }}/wazuh-kubernetes/wazuh/certs"
           IC="$CERTROOT/indexer_cluster"
           DH="$CERTROOT/dashboard_http"
@@ -186,9 +203,11 @@ EOF
       - name: Build overlay (yaml) + single-node tweaks
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           kubectl kustomize "wazuh-kubernetes/wazuh" > /tmp/wazuh-all.yaml
+          # Remove any StorageClass objects from upstream bundle
           yq -i 'del(.[] | select(.kind=="StorageClass"))' /tmp/wazuh-all.yaml
+          # Single-node: 1 indexer replica + PVC sizes
           yq -i '
             (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer").spec.replicas) = 1 |
             (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer").spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "60Gi" |
@@ -198,18 +217,21 @@ EOF
       - name: Apply non-StatefulSet resources
         shell: bash
         run: |
+          set -euo pipefail
           yq -o=y e 'select(.kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/non-sts.yaml
           if [ -s /tmp/non-sts.yaml ]; then kubectl -n "$NS" apply -f /tmp/non-sts.yaml; fi
 
       - name: Apply StatefulSets
         shell: bash
         run: |
+          set -euo pipefail
           yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/sts.yaml
           kubectl -n "$NS" apply -f /tmp/sts.yaml
 
       - name: Wait for core
         shell: bash
         run: |
+          set -euo pipefail
           for sel in "app=wazuh-indexer" "app=wazuh-manager" "app=wazuh-dashboard"; do
             echo "Waiting for: $sel"
             kubectl -n "$NS" wait --for=condition=Ready pod -l "$sel" --timeout=1200s || true
