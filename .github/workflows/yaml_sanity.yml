@@ -1,7 +1,108 @@
-name: yaml-sanity
-on: { workflow_dispatch: {} }
+name: kubeconfig-test
+
+on:
+  workflow_dispatch: {}
+
 jobs:
-  t:
-    runs-on: ubuntu-latest
+  probe:
+    runs-on: [self-hosted, ronin, k8s, control-plane, vmware]
+
+    env:
+      KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
+      KCFG_NEW: ${{ secrets.KUBE_CONFIG_B64_RONIN_NEW }}
+      KCFG_OLD: ${{ secrets.KUBE_CONFIG_B64 }}
+      API_CANDIDATES: ${{ secrets.RONIN_API_CANDIDATES }}
+
     steps:
-      - run: echo "YAML parser accepts this file ✅"
+      - uses: actions/checkout@v4
+
+      - name: Ensure tools (kubectl, yq, nc)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v kubectl >/dev/null 2>&1; then
+            VER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+            curl -fsSL -o kubectl "https://dl.k8s.io/release/${VER}/bin/linux/amd64/kubectl"
+            chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+          fi
+          if ! command -v yq >/dev/null 2>&1; then
+            curl -fsSL -o yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x yq && sudo mv yq /usr/local/bin/yq
+          fi
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y --no-install-recommends netcat-openbsd >/dev/null 2>&1 || true
+          kubectl version --client=true | head -n1
+          yq --version
+
+      - name: Write kubeconfig (prefer NEW secret, fallback to OLD)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${KCFG_NEW:-}" ]; then
+            echo "$KCFG_NEW" | base64 -d > "$KUBECONFIG"
+          elif [ -n "${KCFG_OLD:-}" ]; then
+            echo "$KCFG_OLD" | base64 -d > "$KUBECONFIG"
+          else
+            echo "::error::No kubeconfig secret provided"; exit 1
+          fi
+          chmod 600 "$KUBECONFIG"
+          API_URL="$(yq -r '.clusters[0].cluster.server' "$KUBECONFIG")"
+          echo "Server in kubeconfig: ${API_URL}"
+
+      - name: Connect to API (direct only; try candidates if needed)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          get_host_port () {
+            local url="$1"
+            local host port
+            host="$(echo "$url" | sed -E 's#^https?://([^:/]+).*#\1#')"
+            port="$(echo "$url" | sed -nE 's#^https?://[^:/]+:([0-9]+).*#\1#p')"
+            echo "${host} ${port:-6443}"
+          }
+
+          norm_url () { # -> https://host:port
+            local s="$(echo "$1" | xargs)"
+            [ -z "$s" ] && { echo ""; return; }
+            if [[ "$s" =~ ^https?:// ]]; then echo "$s";
+            elif [[ "$s" =~ :[0-9]+$ ]]; then echo "https://$s";
+            else echo "https://$s:6443"; fi
+          }
+
+          try_url () {
+            local url="$1"
+            read host port < <(get_host_port "$url")
+            echo "Probing ${host}:${port} …"
+            if nc -zv -w3 "$host" "$port"; then
+              echo "Updating kubeconfig to: $url"
+              yq -i ".clusters[].cluster.server = \"$url\"" "$KUBECONFIG"
+              if kubectl --request-timeout=10s cluster-info >/dev/null 2>&1; then
+                echo "✅ Connected to $url"
+                kubectl cluster-info
+                kubectl get nodes -o wide
+                kubectl get ns
+                return 0
+              else
+                echo "TLS/API check failed for $url (trying next)…"
+              fi
+            else
+              echo "No TCP route to ${host}:${port}"
+            fi
+            return 1
+          }
+
+          SERVER="$(yq -r '.clusters[0].cluster.server' "$KUBECONFIG")"
+          try_url "$SERVER" && exit 0
+
+          if [ -n "${API_CANDIDATES:-}" ]; then
+            IFS=',' read -ra ARR <<< "$API_CANDIDATES"
+            for raw in "${ARR[@]}"; do
+              URL="$(norm_url "$raw")"
+              [ -z "$URL" ] && continue
+              try_url "$URL" && exit 0
+            done
+          fi
+
+          echo "::error::Could not reach any Kubernetes API endpoint directly. Update kubeconfig secret or candidates."
+          exit 1
