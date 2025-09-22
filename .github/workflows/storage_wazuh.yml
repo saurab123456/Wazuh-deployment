@@ -30,7 +30,7 @@ jobs:
       KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
       KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
       WAZUH_K8S_TAG: ${{ inputs.wazuh_tag }}
-      OVERLAY_CHOICE: ${{ inputs.overlay }
+      OVERLAY_CHOICE: ${{ inputs.overlay }}
       RAW_KCFG: ${{ secrets.KUBECONFIG }}
       KCFG_B64_A: ${{ secrets.KUBE_CONFIG_B64 }}
       KCFG_B64_B: ${{ secrets.KUBECONFIG_B64 }}
