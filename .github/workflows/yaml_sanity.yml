@@ -5,7 +5,6 @@ on:
 
 jobs:
   probe:
-    # Use only labels your runner actually has
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
 
     env:
@@ -21,33 +20,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          BIN="$HOME/bin"
-          mkdir -p "$BIN"
-          export PATH="$BIN:$PATH"
-          echo "$BIN" >> "$GITHUB_PATH"
-
-          # kubectl
+          BIN="$HOME/bin"; mkdir -p "$BIN"; export PATH="$BIN:$PATH"; echo "$BIN" >> "$GITHUB_PATH"
           if ! command -v kubectl >/dev/null 2>&1; then
             VER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
             curl -fsSL -o "$BIN/kubectl" "https://dl.k8s.io/release/${VER}/bin/linux/amd64/kubectl"
             chmod +x "$BIN/kubectl"
           fi
-
-          # yq
           if ! command -v yq >/dev/null 2>&1; then
-            curl -fsSL -o "$BIN/yq" \
-              https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            curl -fsSL -o "$BIN/yq" https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
             chmod +x "$BIN/yq"
           fi
-
-          # netcat (best-effort install; runner has passwordless sudo)
           sudo -n apt-get update -y >/dev/null 2>&1 || true
           sudo -n apt-get install -y --no-install-recommends netcat-openbsd >/dev/null 2>&1 || true
-
           kubectl version --client=true | head -n1 || true
           yq --version || true
-          nc -h >/dev/null 2>&1 || true
 
       - name: Write kubeconfig (prefer NEW secret, fallback to OLD)
         shell: bash
@@ -61,8 +47,13 @@ jobs:
             echo "::error::No kubeconfig secret provided"; exit 1
           fi
           chmod 600 "$KUBECONFIG"
-          API_URL="$(yq -r '.clusters[0].cluster.server' "$KUBECONFIG")"
-          echo "Server in kubeconfig: ${API_URL}"
+
+          echo "== kubeconfig summary (redacted) =="
+          # List all servers we can see
+          yq -r '.clusters[]? | .name + " -> " + (.cluster.server // "<none>")' "$KUBECONFIG" || true
+          # Verify certs are embedded (shows the keys only, not the data)
+          yq -r '.clusters[]?.cluster | {has_ca_data: has("certificate-authority-data")}' "$KUBECONFIG" || true
+          yq -r '.users[]?.user | {has_client_cert_data: has("client-certificate-data"), has_client_key_data: has("client-key-data")}' "$KUBECONFIG" || true
 
       - name: Connect to API (try kubeconfig URL, then candidates)
         shell: bash
@@ -86,8 +77,9 @@ jobs:
 
           try_url () {
             local url="$1"; read host port < <(get_host_port "$url")
+            if [ -z "$host" ]; then echo "Skip empty URL"; return 1; fi
             echo "Probing ${host}:${port} …"
-            if nc -zv -w3 "$host" "$port" >/dev/null 2>&1; then
+            if nc -z -w3 "$host" "$port" >/dev/null 2>&1; then
               echo "Updating kubeconfig to: $url"
               yq -i ".clusters[].cluster.server = \"$url\"" "$KUBECONFIG"
               if kubectl --request-timeout=10s cluster-info >/dev/null 2>&1; then
@@ -105,9 +97,13 @@ jobs:
             return 1
           }
 
-          SERVER="$(yq -r '.clusters[0].cluster.server' "$KUBECONFIG")"
-          try_url "$SERVER" && exit 0
+          # Try every server we can find in kubeconfig (some files have multiple clusters)
+          mapfile -t SERVERS < <(yq -r '.clusters[]?.cluster.server // empty' "$KUBECONFIG" | xargs -L1 echo)
+          for S in "${SERVERS[@]:-}"; do
+            try_url "$S" && exit 0
+          done
 
+          # Then try explicit candidates if provided
           if [ -n "${API_CANDIDATES:-}" ]; then
             IFS=',' read -ra ARR <<< "$API_CANDIDATES"
             for raw in "${ARR[@]}"; do
