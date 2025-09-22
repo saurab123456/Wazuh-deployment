@@ -384,42 +384,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # JVM / fsGroup / anti-affinity / topology spread / requests-only
           kubectl -n "$NS" patch sts wazuh-indexer --type=merge -p '{
             "spec": {
               "template": {
                 "metadata": { "labels": { "app": "wazuh-indexer" } },
                 "spec": {
                   "securityContext": { "runAsUser": 1000, "runAsGroup": 1000, "fsGroup": 1000 },
-                  "containers": [{
-                    "name": "wazuh-indexer",
-                    "env": [
-                      { "name": "OPENSEARCH_JAVA_OPTS", "value": "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=256m -Dlog4j2.formatMsgNoLookups=true" }
-                    ],
+                  "containers": [ { "name": "wazuh-indexer",
+                    "env": [ { "name": "OPENSEARCH_JAVA_OPTS", "value": "-Xms1g -Xmx1g -XX:MaxDirectMemorySize=256m -Dlog4j2.formatMsgNoLookups=true" } ],
                     "resources": { "requests": { "cpu": "1", "memory": "2Gi" } }
-                  }],
+                  } ],
                   "affinity": {
                     "podAntiAffinity": {
-                      "preferredDuringSchedulingIgnoredDuringExecution": [{
-                        "weight": 100,
-                        "podAffinityTerm": {
-                          "labelSelector": { "matchLabels": { "app": "wazuh-indexer" } },
-                          "topologyKey": "kubernetes.io/hostname"
-                        }
-                      }]
+                      "preferredDuringSchedulingIgnoredDuringExecution": [ { "weight": 100, "podAffinityTerm": {
+                        "labelSelector": { "matchLabels": { "app": "wazuh-indexer" } },
+                        "topologyKey": "kubernetes.io/hostname"
+                      } } ]
                     }
                   },
-                  "topologySpreadConstraints": [{
-                    "maxSkew": 1,
-                    "topologyKey": "kubernetes.io/hostname",
-                    "whenUnsatisfiable": "ScheduleAnyway",
-                    "labelSelector": { "matchLabels": { "app": "wazuh-indexer" } }
-                  }]
+                  "topologySpreadConstraints": [ { "maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
+                    "whenUnsatisfiable": "ScheduleAnyway", "labelSelector": { "matchLabels": { "app": "wazuh-indexer" } } } ]
                 }
               }
             }
           }'
-          # Remove limits if present
           kubectl -n "$NS" patch statefulset wazuh-indexer --type='json' -p='[
             {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
           ]' 2>/dev/null || true
@@ -428,60 +416,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Manager master
-          if kubectl -n "$NS" get sts wazuh-manager-master >/dev/null 2>&1; then
-            kubectl -n "$NS" patch sts wazuh-manager-master --type=merge -p '{
-              "spec": { "template": { "spec": { "containers": [{
-                "name": "wazuh-manager",
-                "resources": { "requests": { "cpu": "500m", "memory": "1536Mi" } }
-              }]}}}
-            }'
-            kubectl -n "$NS" patch statefulset wazuh-manager-master --type='json' -p='[
-              {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
-            ]' 2>/dev/null || true
-          fi
-          # Manager workers (single STS or numbered)
-          if kubectl -n "$NS" get sts wazuh-manager-worker >/dev/null 2>&1; then
-            kubectl -n "$NS" patch sts wazuh-manager-worker --type=merge -p '{
-              "spec": { "template": { "spec": { "containers": [{
-                "name": "wazuh-manager",
-                "resources": { "requests": { "cpu": "500m", "memory": "1Gi" } }
-              }]}}}
-            }' || true
-            kubectl -n "$NS" patch statefulset wazuh-manager-worker --type='json' -p='[
-              {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
-            ]' 2>/dev/null || true
-          else
-            for st in wazuh-manager-worker-0 wazuh-manager-worker-1; do
-              kubectl -n "$NS" patch sts "$st" --type=merge -p '{
-                "spec": { "template": { "spec": { "containers": [{
-                  "name": "wazuh-manager",
-                  "resources": { "requests": { "cpu": "500m", "memory": "1Gi" } }
-                }]}}}
-              }' 2>/dev/null || true
-              kubectl -n "$NS" patch statefulset "$st" --type='json' -p='[
-                {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
-              ]' 2>/dev/null || true
-            done
-          fi
-          # Dashboard
-          if kubectl -n "$NS" get deploy wazuh-dashboard >/dev/null 2>&1; then
-            kubectl -n "$NS" patch deploy wazuh-dashboard --type=merge -p '{
-              "spec": { "template": { "spec": { "containers": [{
-                "name": "wazuh-dashboard",
-                "resources": { "requests": { "cpu": "200m", "memory": "512Mi" } }
-              }]}}}
-            }'
-            kubectl -n "$NS" patch deploy wazuh-dashboard --type='json' -p='[
-              {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
-            ]' 2>/dev/null || true
-          fi
+          # helper: set requests and clear limits safely
+          set_resources_clear_limits() {
+            local kind="$1" name="$2" container="$3" cpu="$4" mem="$5"
+            kubectl -n "$NS" get "$kind" "$name" >/dev/null 2>&1 || return 0
+            # set requests via kubectl (doesn't clobber image)
+            kubectl -n "$NS" set resources "$kind/$name" \
+              --containers="$container" --requests="cpu=$cpu,memory=$mem" --limits="" || true
+            # hard-remove limits in case kubectl kept an empty map
+            idx="$(kubectl -n "$NS" get "$kind" "$name" -o json | jq -r \
+              --arg c "$container" '.spec.template.spec.containers
+                 | to_entries | map(select(.value.name==$c)) | .[0].key // empty')"
+            if [ -n "$idx" ]; then
+              kubectl -n "$NS" patch "$kind" "$name" --type=json \
+                -p="[ {\"op\":\"remove\",\"path\":\"/spec/template/spec/containers/$idx/resources/limits\"} ]" 2>/dev/null || true
+            fi
+          }
+          set_resources_clear_limits statefulset wazuh-manager-master wazuh-manager 500m 1536Mi
+          set_resources_clear_limits statefulset wazuh-manager-worker wazuh-manager 500m 1Gi
+          for st in wazuh-manager-worker-0 wazuh-manager-worker-1; do
+            set_resources_clear_limits statefulset "$st" wazuh-manager 500m 1Gi
+          done
+          set_resources_clear_limits deployment wazuh-dashboard wazuh-dashboard 200m 512Mi
 
       - name: Resize PVCs (Indexer→30Gi, Manager master→15Gi, Dashboard→10Gi)
         shell: bash
         run: |
           set -euo pipefail
-
           supports_expansion () {
             local pvc="$1"
             local sc
@@ -489,7 +450,6 @@ jobs:
             [ -z "$sc" ] && { echo "no"; return; }
             kubectl get sc "$sc" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null | grep -qi true && echo "yes" || echo "no"
           }
-
           resize_pvc () {
             local pvc="$1" newsize="$2"
             kubectl -n "$NS" get pvc "$pvc" >/dev/null 2>&1 || { echo "::warning::PVC $pvc not found"; return; }
@@ -501,28 +461,18 @@ jobs:
             echo "Resizing $pvc -> $newsize"
             kubectl -n "$NS" patch pvc "$pvc" --type=merge -p "{\"spec\":{\"resources\":{\"requests\":{\"storage\":\"$newsize\"}}}}"
           }
-
-          # Indexers (standard claim names from manifest template)
-          for i in 0 1 2; do
-            resize_pvc "wazuh-indexer-wazuh-indexer-$i" "30Gi" || true
-          done
-
-          # Manager master (discover PVCs from pod)
+          for i in 0 1 2; do resize_pvc "wazuh-indexer-wazuh-indexer-$i" "30Gi" || true; done
           if kubectl -n "$NS" get pod wazuh-manager-master-0 >/dev/null 2>&1; then
             mapfile -t MM_PVCS < <(kubectl -n "$NS" get pod wazuh-manager-master-0 -o json \
               | jq -r '.spec.volumes[] | select(.persistentVolumeClaim) | .persistentVolumeClaim.claimName')
             for pvc in "${MM_PVCS[@]:-}"; do resize_pvc "$pvc" "15Gi"; done
           fi
-
-          # Dashboard (discover pod + PVCs)
           DASH_POD="$(kubectl -n "$NS" get pods -l app=wazuh-dashboard -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
           if [ -n "${DASH_POD:-}" ]; then
             mapfile -t DASH_PVCS < <(kubectl -n "$NS" get pod "$DASH_POD" -o json \
               | jq -r '.spec.volumes[] | select(.persistentVolumeClaim) | .persistentVolumeClaim.claimName')
             for pvc in "${DASH_PVCS[@]:-}"; do resize_pvc "$pvc" "10Gi"; done
           fi
-
-          echo "PVCs after resize request:"
           kubectl -n "$NS" get pvc
 
       - name: Wait & diagnose core components
@@ -662,7 +612,6 @@ jobs:
             ports:
               - { name: agents-events, port: 1514, targetPort: 1514, protocol: TCP }
           EOF
-          echo "Services and endpoints:"
           kubectl -n "$NS" get svc -o wide
           kubectl -n "$NS" get endpoints -o wide
 
