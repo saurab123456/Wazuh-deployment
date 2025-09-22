@@ -80,42 +80,35 @@ jobs:
       - name: Ensure namespace
         shell: bash
         run: |
+          set -euo pipefail
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Ensure vm.max_map_count via DaemonSet
+      - name: Ensure vm.max_map_count via DaemonSet (write YAML via printf)
         shell: bash
         run: |
           set -euo pipefail
-          cat >/tmp/wazuh-sysctl-ds.yaml <<'EOF'
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: wazuh-sysctl
-  namespace: kube-system
-  labels:
-    app: wazuh-sysctl
-spec:
-  selector:
-    matchLabels:
-      app: wazuh-sysctl
-  template:
-    metadata:
-      labels:
-        app: wazuh-sysctl
-    spec:
-      hostPID: true
-      tolerations:
-        - operator: "Exists"
-      containers:
-        - name: sysctl
-          image: busybox:1.36
-          securityContext:
-            privileged: true
-          command: ["/bin/sh","-c"]
-          args:
-            - |
-              set -e
-              echo 262144 > /host-proc/sys/vm/max_map_count
-              mkdir -p /host-etc/sysctl.d
-              echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
-              echo "
+          DS=/tmp/wazuh-sysctl-ds.yaml
+          printf '%s\n' \
+            'apiVersion: apps/v1' \
+            'kind: DaemonSet' \
+            'metadata:' \
+            '  name: wazuh-sysctl' \
+            '  namespace: kube-system' \
+            '  labels:' \
+            '    app: wazuh-sysctl' \
+            'spec:' \
+            '  selector:' \
+            '    matchLabels:' \
+            '      app: wazuh-sysctl' \
+            '  template:' \
+            '    metadata:' \
+            '      labels:' \
+            '        app: wazuh-sysctl' \
+            '    spec:' \
+            '      hostPID: true' \
+            '      tolerations:' \
+            '        - operator: "Exists"' \
+            '      containers:' \
+            '        - name: sysctl' \
+            '          image: busybox:1.36' \
+            '          securityContext:' \
