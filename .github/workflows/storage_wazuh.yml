@@ -1,4 +1,4 @@
-name: 01) Wazuh - Storage + Core (single-node)
+name: 01) Deploy Wazuh Core (single-node lab, autoscale)
 
 on:
   workflow_dispatch:
@@ -21,170 +21,89 @@ on:
         default: "8444"
 
 jobs:
-  storage_core:
+  core:
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
     timeout-minutes: 120
 
     env:
       NS: wazuh
-      KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
-      KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
       WAZUH_K8S_TAG: ${{ inputs.wazuh_tag }}
       OVERLAY_CHOICE: ${{ inputs.overlay }}
-      RAW_KCFG: ${{ secrets.KUBECONFIG }}
-      KCFG_B64_A: ${{ secrets.KUBE_CONFIG_B64 }}
-      KCFG_B64_B: ${{ secrets.KUBECONFIG_B64 }}
+      LOCAL_FORWARD_PORT: ${{ inputs.local_forward_port }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install CLIs (no sudo) and persist PATH
+      - name: Install CLIs (no sudo)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$HOME/bin"
           echo "$HOME/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/bin:$PATH"
-          if ! command -v kubectl >/dev/null 2>&1; then
+          if ! command -v kubectl >/dev/null; then
             KVER="$(curl -sS https://dl.k8s.io/release/stable.txt)"
             curl -sSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o "$HOME/bin/kubectl"
             chmod +x "$HOME/bin/kubectl"
           fi
-          if ! command -v yq >/dev/null 2>&1; then
+          if ! command -v yq >/dev/null; then
             curl -sSL -o "$HOME/bin/yq" https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
             chmod +x "$HOME/bin/yq"
           fi
-          if ! command -v jq >/dev/null 2>&1; then
+          if ! command -v jq >/dev/null; then
             curl -sSL -o "$HOME/bin/jq" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
             chmod +x "$HOME/bin/jq"
           fi
-
-      - name: Write kubeconfig (raw or base64)
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${RAW_KCFG:-}" ]; then
-            printf '%s' "$RAW_KCFG" > "$KUBECONFIG_PATH"
-          elif [ -n "${KCFG_B64_A:-}" ]; then
-            printf '%s' "$KCFG_B64_A" | base64 -d > "$KUBECONFIG_PATH"
-          elif [ -n "${KCFG_B64_B:-}" ]; then
-            printf '%s' "$KCFG_B64_B" | base64 -d > "$KUBECONFIG_PATH"
-          else
-            echo "::error::No kubeconfig secret found (KUBECONFIG or KUBE_CONFIG_B64 or KUBECONFIG_B64)"; exit 1
-          fi
-          chmod 600 "$KUBECONFIG_PATH"
-          kubectl cluster-info
-          kubectl get nodes -o wide
 
       - name: Ensure namespace
         shell: bash
         run: |
           kubectl create namespace "$NS" --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Ensure vm.max_map_count via DaemonSet
+      - name: Ensure vm.max_map_count via DaemonSet (required by OpenSearch)
         shell: bash
         run: |
-          set -euo pipefail
-          DS=/tmp/wazuh-sysctl-ds.yaml
-          printf '%s\n' \
-            'apiVersion: apps/v1' \
-            'kind: DaemonSet' \
-            'metadata:' \
-            '  name: wazuh-sysctl' \
-            '  namespace: kube-system' \
-            '  labels:' \
-            '    app: wazuh-sysctl' \
-            'spec:' \
-            '  selector:' \
-            '    matchLabels:' \
-            '      app: wazuh-sysctl' \
-            '  template:' \
-            '    metadata:' \
-            '      labels:' \
-            '        app: wazuh-sysctl' \
-            '    spec:' \
-            '      hostPID: true' \
-            '      tolerations:' \
-            '        - operator: "Exists"' \
-            '      containers:' \
-            '        - name: sysctl' \
-            '          image: busybox:1.36' \
-            '          securityContext:' \
-            '            privileged: true' \
-            '          command: ["/bin/sh","-c"]' \
-            '          args:' \
-            '            - |' \
-            '              set -e' \
-            '              echo 262144 > /host-proc/sys/vm/max_map_count' \
-            '              mkdir -p /host-etc/sysctl.d' \
-            '              echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf' \
-            '              sleep 3600' \
-            '          volumeMounts:' \
-            '            - name: host-proc' \
-            '              mountPath: /host-proc' \
-            '            - name: host-etc' \
-            '              mountPath: /host-etc' \
-            '      volumes:' \
-            '        - name: host-proc' \
-            '          hostPath:' \
-            '            path: /proc' \
-            '            type: Directory' \
-            '        - name: host-etc' \
-            '          hostPath:' \
-            '            path: /etc' \
-            '            type: Directory' \
-            > "$DS"
-          kubectl apply -f "$DS"
+          cat > /tmp/wazuh-sysctl-ds.yaml <<'YAML'
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: wazuh-sysctl
+            namespace: kube-system
+            labels: { app: wazuh-sysctl }
+          spec:
+            selector: { matchLabels: { app: wazuh-sysctl } }
+            template:
+              metadata: { labels: { app: wazuh-sysctl } }
+              spec:
+                hostPID: true
+                tolerations: [ {operator: "Exists"} ]
+                containers:
+                  - name: sysctl
+                    image: busybox:1.36
+                    securityContext: { privileged: true }
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        echo 262144 > /host-proc/sys/vm/max_map_count
+                        mkdir -p /host-etc/sysctl.d
+                        echo "vm.max_map_count=262144" > /host-etc/sysctl.d/99-wazuh.conf
+                        sleep 3600
+                    volumeMounts:
+                      - { name: host-proc, mountPath: /host-proc }
+                      - { name: host-etc,  mountPath: /host-etc  }
+                volumes:
+                  - { name: host-proc, hostPath: { path: /proc, type: Directory } }
+                  - { name: host-etc,  hostPath: { path: /etc,  type: Directory } }
+          YAML
+          kubectl apply -f /tmp/wazuh-sysctl-ds.yaml
 
-      - name: Prepare StorageClass alias "wazuh-storage" (safe replace)
+      - name: Fetch official wazuh-kubernetes repo
         shell: bash
         run: |
-          set -euo pipefail
-          TARGET_SC="$(kubectl get sc -o json | yq -r '.items[] | select(.metadata.annotations."storageclass.kubernetes.io/is-default-class"=="true") | .metadata.name' | head -n1 || true)"
-          if [ -z "${TARGET_SC:-}" ]; then
-            if kubectl get sc local-path >/dev/null 2>&1; then
-              TARGET_SC="local-path"
-            else
-              echo "::error::No dynamic StorageClass found (default or local-path)"; exit 1
-            fi
-          fi
-          PROV="$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')"
-
-          NEED_CREATE="true"
-          if kubectl get sc wazuh-storage >/dev/null 2>&1; then
-            CUR_PROV="$(kubectl get sc wazuh-storage -o jsonpath='{.provisioner}' || true)"
-            CUR_VBM="$(kubectl get sc wazuh-storage -o jsonpath='{.volumeBindingMode}' || true)"
-            CUR_EXP="$(kubectl get sc wazuh-storage -o jsonpath='{.allowVolumeExpansion}' || true)"
-            if [ "$CUR_PROV" != "$PROV" ] || [ "$CUR_VBM" != "WaitForFirstConsumer" ] || ! echo "$CUR_EXP" | grep -qi true; then
-              kubectl delete sc wazuh-storage
-            else
-              NEED_CREATE="false"
-              echo "wazuh-storage already matches desired settings"
-            fi
-          fi
-
-          if [ "$NEED_CREATE" = "true" ]; then
-            SC=/tmp/wazuh-sc.yaml
-            printf '%s\n' \
-              'apiVersion: storage.k8s.io/v1' \
-              'kind: StorageClass' \
-              'metadata:' \
-              '  name: wazuh-storage' \
-              "provisioner: ${PROV}" \
-              'reclaimPolicy: Delete' \
-              'volumeBindingMode: WaitForFirstConsumer' \
-              'allowVolumeExpansion: true' \
-              > "$SC"
-            kubectl apply -f "$SC"
-          fi
-
-          kubectl get sc -o wide
-
-      - name: Fetch wazuh-kubernetes repo
-        shell: bash
-        run: |
-          set -euo pipefail
+          set -e
+          rm -rf wazuh-kubernetes
           git clone --depth 1 --branch "$WAZUH_K8S_TAG" https://github.com/wazuh/wazuh-kubernetes.git
 
       - name: Generate self-signed certs (indexer + dashboard)
@@ -202,58 +121,154 @@ jobs:
           done
           openssl req -x509 -nodes -days 825 -newkey rsa:2048 -keyout "$DH/key.pem" -out "$DH/cert.pem" -subj "/CN=dashboard"
 
-      - name: Build overlay (yaml) + single-node tweaks (and drop any StorageClass)
+      - name: Build overlay (drop StorageClass; single-node: 1 indexer, 1 worker)
         shell: bash
         run: |
-          set -euo pipefail
+          set -e
           kubectl kustomize "$GITHUB_WORKSPACE/wazuh-kubernetes/wazuh" > /tmp/wazuh-all.yaml
-          # Hard-drop any StorageClass from bundle (robust way)
-          yq e 'select(.kind != "StorageClass")' /tmp/wazuh-all.yaml > /tmp/wazuh-no-sc.yaml
-          mv /tmp/wazuh-no-sc.yaml /tmp/wazuh-all.yaml
-          # Single-node: 1 indexer replica + PVC sizes
+          yq e 'select(.kind != "StorageClass")' /tmp/wazuh-all.yaml > /tmp/wazuh-all.nosc.yaml
+          mv /tmp/wazuh-all.nosc.yaml /tmp/wazuh-all.yaml
           yq -i '
             (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer").spec.replicas) = 1 |
-            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-indexer").spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "60Gi" |
-            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-manager-master").spec.volumeClaimTemplates[]?).spec.resources.requests.storage = "20Gi"
+            (.[] | select(.kind=="StatefulSet" and .metadata.name=="wazuh-manager-worker").spec.replicas) = 1
           ' /tmp/wazuh-all.yaml
+          # avoid "already exists" noise on re-run
+          kubectl -n "$NS" delete deploy wazuh-dashboard --ignore-not-found=true || true
 
-      - name: Apply non-StatefulSet resources (exclude StorageClass)
+      - name: Apply non-StatefulSet resources
         shell: bash
         run: |
-          set -euo pipefail
-          yq -o=y e 'select(.kind != "StatefulSet" and .kind != "StorageClass")' /tmp/wazuh-all.yaml > /tmp/non-sts.yaml
+          yq -o=y e 'select(.kind != "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/non-sts.yaml
           if [ -s /tmp/non-sts.yaml ]; then kubectl -n "$NS" apply -f /tmp/non-sts.yaml; fi
 
       - name: Apply StatefulSets
         shell: bash
         run: |
-          set -euo pipefail
           yq -o=y e 'select(.kind == "StatefulSet")' /tmp/wazuh-all.yaml > /tmp/sts.yaml
           kubectl -n "$NS" apply -f /tmp/sts.yaml
 
-      - name: Wait for core
+      - name: Remove limits + set baseline requests + set indexer heap
         shell: bash
         run: |
           set -euo pipefail
+          # Indexer: set heap to 1g, no limits, modest requests
+          kubectl -n "$NS" set env statefulset/wazuh-indexer OPENSEARCH_JAVA_OPTS="-Xms1g -Xmx1g -Dlog4j2.formatMsgNoLookups=true"
+          kubectl -n "$NS" patch statefulset wazuh-indexer --type='json' -p='[
+            {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
+          ]' || true
+          kubectl -n "$NS" set resources statefulset/wazuh-indexer \
+            --containers=wazuh-indexer --requests=cpu=500m,memory=1500Mi
+
+          # Managers: no limits, modest requests (master + one worker)
+          for s in wazuh-manager-master wazuh-manager-worker; do
+            kubectl -n "$NS" set resources statefulset/$s \
+              --containers=wazuh-manager --requests=cpu=300m,memory=1Gi --limits=
+            kubectl -n "$NS" patch statefulset $s --type='json' -p='[
+              {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
+            ]' || true
+          done
+
+          # Dashboard: no limits, modest requests
+          kubectl -n "$NS" set resources deploy/wazuh-dashboard \
+            --containers=wazuh-dashboard --requests=cpu=200m,memory=512Mi --limits=
+          kubectl -n "$NS" patch deploy/wazuh-dashboard --type='json' -p='[
+            {"op":"remove","path":"/spec/template/spec/containers/0/resources/limits"}
+          ]' || true
+
+          # Restart indexer to pick new env/resources immediately
+          kubectl -n "$NS" rollout restart statefulset/wazuh-indexer
+
+      - name: Ensure metrics-server (for HPA)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! kubectl get apiservices.apiregistration.k8s.io v1beta1.metrics.k8s.io >/dev/null 2>&1; then
+            kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+          fi
+
+      - name: Create HPAs (dashboard + manager-worker)
+        shell: bash
+        run: |
+          cat > /tmp/hpa-dashboard.yaml <<'YAML'
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: wazuh-dashboard
+            namespace: wazuh
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: wazuh-dashboard
+            minReplicas: 1
+            maxReplicas: 2
+            metrics:
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: 65
+              - type: Resource
+                resource:
+                  name: memory
+                  target:
+                    type: Utilization
+                    averageUtilization: 70
+          YAML
+          cat > /tmp/hpa-manager-worker.yaml <<'YAML'
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: wazuh-manager-worker
+            namespace: wazuh
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: StatefulSet
+              name: wazuh-manager-worker
+            minReplicas: 1
+            maxReplicas: 3
+            metrics:
+              - type: Resource
+                resource:
+                  name: cpu
+                  target:
+                    type: Utilization
+                    averageUtilization: 65
+              - type: Resource
+                resource:
+                  name: memory
+                  target:
+                    type: Utilization
+                    averageUtilization: 70
+          YAML
+          kubectl apply -f /tmp/hpa-dashboard.yaml
+          kubectl apply -f /tmp/hpa-manager-worker.yaml
+
+      - name: Wait for core to be Ready
+        shell: bash
+        run: |
+          set -e
           for sel in "app=wazuh-indexer" "app=wazuh-manager" "app=wazuh-dashboard"; do
             echo "Waiting for: $sel"
             kubectl -n "$NS" wait --for=condition=Ready pod -l "$sel" --timeout=1200s || true
             kubectl -n "$NS" get pods -l "$sel" -o wide
           done
 
-      - name: Discover dashboard port
+      - name: Discover Dashboard port
         id: dash
         shell: bash
         run: |
           set -euo pipefail
-          P="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
-          if [ -z "${P:-}" ]; then
-            P="$(kubectl -n "$NS" get deploy wazuh-dashboard -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || true)"
+          PORT="$(kubectl -n "$NS" get svc -l app=wazuh-dashboard -o jsonpath='{.items[0].spec.ports[0].port}' 2>/dev/null || true)"
+          if [ -z "${PORT:-}" ]; then
+            PORT="$(kubectl -n "$NS" get deploy wazuh-dashboard -o jsonpath='{.spec.template.spec.containers[0].ports[0].containerPort}' 2>/dev/null || true)"
           fi
-          test -n "${P:-}" || { echo "::error::Could not find dashboard port"; exit 1; }
-          echo "port=$P" >> "$GITHUB_OUTPUT"
+          test -n "${PORT:-}" || { echo "::error::Could not determine dashboard port"; exit 1; }
+          echo "dash_port=${PORT}" >> "$GITHUB_OUTPUT"
 
-      - name: Optional port-forward to dashboard
+      - name: Start Dashboard port-forward (optional)
         if: ${{ inputs.enable_port_forward == 'true' }}
         shell: bash
         env:
@@ -261,7 +276,13 @@ jobs:
           PF_PORT: ${{ inputs.local_forward_port }}
         run: |
           set -euo pipefail
-          TARGET_PORT="${{ steps.dash.outputs.port }}"
+          TARGET_PORT="${{ steps.dash.outputs.dash_port }}"
           (pkill -f "port-forward .*:${PF_PORT}:" && sleep 1) || true
           nohup kubectl -n "${NS}" port-forward --address "${PF_BIND}" deploy/wazuh-dashboard "${PF_PORT}:${TARGET_PORT}" > portforward.log 2>&1 &
-          echo "::notice title=Browse Dashboard::http://localhost:${PF_PORT}"
+          echo "::notice title=Browse Now::Open http://localhost:${PF_PORT}"
+
+      - name: Final status
+        shell: bash
+        run: |
+          kubectl -n "$NS" get hpa
+          kubectl -n "$NS" get pods -o wide
