@@ -1,42 +1,70 @@
-name: CI on Ronin
+name: YAML Sanity (Ronin runner + kubeconfig)
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
 
+# This job runs on your Ronin self-hosted runner
 jobs:
-  build-and-deploy:
-    runs-on: [self-hosted, linux, ronin]   # must match labels you set
+  sanity:
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
     timeout-minutes: 60
+
+    # Map secrets into env FIRST (this is the safe way to use them in bash)
     env:
-      KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
+      KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
+      RAW_KCFG: ${{ secrets.KUBECONFIG }}         # plain kubeconfig (recommended)
+      KCFG_B64: ${{ secrets.KUBECONFIG_B64 }}     # base64 version (optional)
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Write kubeconfig
-        if: secrets.KUBECONFIG != ''
+      - name: Mask secrets (avoid leaking in logs)
         shell: bash
         run: |
-          # If you stored raw kubeconfig in the secret:
-          printf '%s' "${{ secrets.KUBECONFIG }}" > "$KUBECONFIG"
-          chmod 600 "$KUBECONFIG"
-
-      - name: Ensure kubectl (no sudo)
-        shell: bash
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          if ! command -v kubectl >/dev/null 2>&1; then
-            curl -fsSLo "$HOME/.local/bin/kubectl" "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
-            chmod +x "$HOME/.local/bin/kubectl"
-            echo "$HOME/.local/bin" >> $GITHUB_PATH
+          if [ -n "${RAW_KCFG:-}" ]; then
+            echo "::add-mask::$RAW_KCFG"
+          fi
+          if [ -n "${KCFG_B64:-}" ]; then
+            echo "::add-mask::$KCFG_B64"
           fi
 
-      - name: Sanity check cluster
-        run: kubectl get nodes -o wide
-
-      - name: Your deploy step
+      - name: Ensure kubectl is available (no sudo)
+        shell: bash
         run: |
-          # e.g., kubectl apply -k k8s/overlays/single
-          echo "Do deploy here"
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSL -o "$HOME/.local/bin/kubectl" \
+              "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x "$HOME/.local/bin/kubectl"
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # ✅ CORRECT secret usage — note the ${{ ... }} only in env above, not here.
+      - name: Write kubeconfig from secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${RAW_KCFG:-}" ]; then
+            echo "Using RAW kubeconfig from secret KUBECONFIG"
+            printf '%s' "$RAW_KCFG" > "$KUBECONFIG_PATH"
+          elif [ -n "${KCFG_B64:-}" ]; then
+            echo "Using base64 kubeconfig from secret KUBECONFIG_B64"
+            printf '%s' "$KCFG_B64" | base64 -d > "$KUBECONFIG_PATH"
+          else
+            echo "::error::No kubeconfig found. Please set KUBECONFIG (raw) or KUBECONFIG_B64."
+            exit 1
+          fi
+          chmod 600 "$KUBECONFIG_PATH"
+
+      - name: Sanity check cluster connectivity
+        shell: bash
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        run: |
+          set -euo pipefail
+          kubectl version --short
+          kubectl get nodes -o wide
