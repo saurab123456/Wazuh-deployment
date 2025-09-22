@@ -130,26 +130,56 @@ jobs:
             kubectl -n kube-system logs "$p" || true
           done
 
+      # ---------- ROBUST: guarantee a dynamic SC and alias it as 'wazuh-storage' ----------
       - name: Ensure StorageClass alias 'wazuh-storage'
         shell: bash
         run: |
-          set -e
-          if kubectl get sc local-path >/dev/null 2>&1; then
+          set -euo pipefail
+
+          pick_dynamic_sc() {
+            local def dyn
+            def="$(kubectl get sc -o json \
+                | yq -r '.items[]
+                         | select(.provisioner != "kubernetes.io/no-provisioner")
+                         | select(.metadata.annotations."storageclass.kubernetes.io/is-default-class" == "true")
+                         | .metadata.name' | head -n1 || true)"
+            if [ -n "${def:-}" ]; then
+              echo "$def"; return 0
+            fi
+            dyn="$(kubectl get sc -o json \
+                | yq -r '.items[]
+                         | select(.provisioner != "kubernetes.io/no-provisioner")
+                         | .metadata.name' | head -n1 || true)"
+            [ -n "${dyn:-}" ] && echo "$dyn"
+          }
+
+          TARGET_SC="$(pick_dynamic_sc || true)"
+
+          if [ -z "${TARGET_SC:-}" ]; then
+            echo "No dynamic StorageClass found. Installing local-path-provisioner …"
+            kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+            kubectl -n local-path-storage rollout status deploy/local-path-provisioner --timeout=180s
+            kubectl annotate sc local-path storageclass.kubernetes.io/is-default-class="true" --overwrite || true
             TARGET_SC="local-path"
-          else
-            TARGET_SC="$(kubectl get sc -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.provisioner}{"\n"}{end}' | awk '$2!="kubernetes.io/no-provisioner"{print $1; exit}')"
           fi
-          test -n "$TARGET_SC" || { echo "::error::No dynamic StorageClass found"; exit 1; }
-          TARGET_PROV="$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')"
-          cat <<EOF | kubectl apply -f -
-          apiVersion: storage.k8s.io/v1
-          kind: StorageClass
-          metadata: { name: wazuh-storage }
-          provisioner: ${TARGET_PROV}
-          reclaimPolicy: Delete
-          volumeBindingMode: WaitForFirstConsumer
-          allowVolumeExpansion: true
-          EOF
+
+          echo "Using dynamic StorageClass: ${TARGET_SC}"
+
+          kubectl get sc "$TARGET_SC" -o json \
+          | yq -o=y '
+            {
+              apiVersion: "storage.k8s.io/v1",
+              kind: "StorageClass",
+              metadata: { name: "wazuh-storage" },
+              provisioner: .provisioner,
+              parameters: (.parameters // {}),
+              reclaimPolicy: (.reclaimPolicy // "Delete"),
+              volumeBindingMode: (.volumeBindingMode // "WaitForFirstConsumer"),
+              allowVolumeExpansion: (.allowVolumeExpansion // true)
+            }
+          ' | kubectl apply -f -
+
+          kubectl get sc -o wide
 
       - name: Fetch official wazuh-kubernetes repo
         shell: bash
@@ -306,7 +336,6 @@ jobs:
             kubectl -n "$NS" apply -f /tmp/wazuh-sts.yaml
           fi
 
-      # guard so managers boot passwordless even if anything re-templates
       - name: Add initContainer guard to managers (force passwordless on boot)
         shell: bash
         run: |
@@ -414,7 +443,6 @@ jobs:
             kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc 'sed -n "/<auth>/,/<\\/auth>/p" /var/ossec/etc/ossec.conf'
           done
 
-      # ✅ NEW: Post-deploy verification — fail if any manager uses password auth
       - name: Verify managers are passwordless (hard fail if misconfigured)
         shell: bash
         run: |
