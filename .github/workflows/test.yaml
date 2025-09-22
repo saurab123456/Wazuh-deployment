@@ -1,0 +1,24 @@
+name: deploy-wazuh
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, ronin, k8s, control-plane, vmware]
+    env:
+      KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write kubeconfig
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_B64_RONIN_NEW }}" | base64 -d > "$KUBECONFIG"
+          chmod 600 "$KUBECONFIG"
+          kubectl cluster-info
+
+      # replace with your actual manifests/kustomize
+      - name: Apply manifests
+        run: |
+          kubectl apply -f manifests/
+          kubectl -n wazuh get pods -o wide
