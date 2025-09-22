@@ -165,19 +165,18 @@ jobs:
 
           echo "Using dynamic StorageClass: ${TARGET_SC}"
 
-          kubectl get sc "$TARGET_SC" -o json \
-          | yq -o=y '
-            {
-              apiVersion: "storage.k8s.io/v1",
-              kind: "StorageClass",
-              metadata: { name: "wazuh-storage" },
-              provisioner: .provisioner,
-              parameters: (.parameters // {}),
-              reclaimPolicy: (.reclaimPolicy // "Delete"),
-              volumeBindingMode: (.volumeBindingMode // "WaitForFirstConsumer"),
-              allowVolumeExpansion: (.allowVolumeExpansion // true)
-            }
-          ' | kubectl apply -f -
+          PROV="$(kubectl get sc "$TARGET_SC" -o jsonpath='{.provisioner}')"
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: wazuh-storage
+          provisioner: ${PROV}
+          reclaimPolicy: Delete
+          volumeBindingMode: WaitForFirstConsumer
+          allowVolumeExpansion: true
+          EOF
 
           kubectl get sc -o wide
 
@@ -459,28 +458,18 @@ jobs:
             MOUNTED_LINE="$(kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc '[ -f /wazuh-config-mount/etc/ossec.conf ] && grep -o \"<use_password>[^<]*</use_password>\" /wazuh-config-mount/etc/ossec.conf || true')"
             PORT_OK="$(kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc 'grep -q \"<port>1515</port>\" /var/ossec/etc/ossec.conf && echo ok || echo bad')"
             AUTHD_PASS_PRESENT="$(kubectl -n "$NS" exec "$P" -c wazuh-manager -- sh -lc '[ -f /var/ossec/etc/authd.pass ] && echo present || echo absent')"
-
             echo "  runtime use_password: ${RUNTIME_LINE:-<none>}"
             echo "  mounted use_password: ${MOUNTED_LINE:-<none or no mount>}"
             echo "  runtime port 1515: $PORT_OK"
             echo "  authd.pass: $AUTHD_PASS_PRESENT"
-
             if echo "${RUNTIME_LINE}" | grep -q '<use_password>yes</use_password>'; then
-              echo "::error file=/var/ossec/etc/ossec.conf,title=Runtime shows password enabled::$P has <use_password>yes</use_password>"
-              FAIL=1
-            fi
+              echo "::error file=/var/ossec/etc/ossec.conf,title=Runtime shows password enabled::$P has <use_password>yes</use_password>"; FAIL=1; fi
             if [ -n "${MOUNTED_LINE}" ] && echo "${MOUNTED_LINE}" | grep -q '<use_password>yes</use_password>'; then
-              echo "::error file=/wazuh-config-mount/etc/ossec.conf,title=Mounted CM shows password enabled::$P has <use_password>yes</use_password> in ConfigMap"
-              FAIL=1
-            fi
+              echo "::error file=/wazuh-config-mount/etc/ossec.conf,title=Mounted CM shows password enabled::$P has <use_password>yes</use_password> in ConfigMap"; FAIL=1; fi
             if [ "$PORT_OK" != "ok" ]; then
-              echo "::error file=/var/ossec/etc/ossec.conf,title=Wrong authd port::$P does not have <port>1515</port>"
-              FAIL=1
-            fi
+              echo "::error file=/var/ossec/etc/ossec.conf,title=Wrong authd port::$P does not have <port>1515</port>"; FAIL=1; fi
             if [ "$AUTHD_PASS_PRESENT" = "present" ]; then
-              echo "::error file=/var/ossec/etc/authd.pass,title=Password file present::$P has /var/ossec/etc/authd.pass present (should be absent)"
-              FAIL=1
-            fi
+              echo "::error file=/var/ossec/etc/authd.pass,title=Password file present::$P has /var/ossec/etc/authd.pass present (should be absent)"; FAIL=1; fi
           done
           if [ "$FAIL" -ne 0 ]; then
             echo "::error::One or more wazuh-manager pods are not passwordless. See errors above."
