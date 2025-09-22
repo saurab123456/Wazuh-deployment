@@ -5,8 +5,8 @@ on:
 
 jobs:
   probe:
-    # keep vmware only if your runner has that label (it looks like it does)
-    runs-on: [self-hosted, linux, ronin, k8s, control-plane, vmware]
+    # Use only labels your runner actually has
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
 
     env:
       KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
@@ -17,14 +17,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure tools (kubectl, yq, nc) without sudo to /home/actions/bin
+      - name: Ensure tools (kubectl, yq, nc) without sudo to ~/bin
         shell: bash
         run: |
           set -euo pipefail
 
           BIN="$HOME/bin"
           mkdir -p "$BIN"
-          # make it available both now and for later steps
           export PATH="$BIN:$PATH"
           echo "$BIN" >> "$GITHUB_PATH"
 
@@ -42,12 +41,13 @@ jobs:
             chmod +x "$BIN/yq"
           fi
 
-          # netcat (sudo apt-get is whitelisted in your sudoers)
+          # netcat (best-effort install; runner has passwordless sudo)
           sudo -n apt-get update -y >/dev/null 2>&1 || true
           sudo -n apt-get install -y --no-install-recommends netcat-openbsd >/dev/null 2>&1 || true
 
-          kubectl version --client=true | head -n1
-          yq --version
+          kubectl version --client=true | head -n1 || true
+          yq --version || true
+          nc -h >/dev/null 2>&1 || true
 
       - name: Write kubeconfig (prefer NEW secret, fallback to OLD)
         shell: bash
@@ -64,7 +64,7 @@ jobs:
           API_URL="$(yq -r '.clusters[0].cluster.server' "$KUBECONFIG")"
           echo "Server in kubeconfig: ${API_URL}"
 
-      - name: Connect to API (direct only; try candidates if needed)
+      - name: Connect to API (try kubeconfig URL, then candidates)
         shell: bash
         run: |
           set -euo pipefail
@@ -87,14 +87,14 @@ jobs:
           try_url () {
             local url="$1"; read host port < <(get_host_port "$url")
             echo "Probing ${host}:${port} …"
-            if nc -zv -w3 "$host" "$port"; then
+            if nc -zv -w3 "$host" "$port" >/dev/null 2>&1; then
               echo "Updating kubeconfig to: $url"
               yq -i ".clusters[].cluster.server = \"$url\"" "$KUBECONFIG"
               if kubectl --request-timeout=10s cluster-info >/dev/null 2>&1; then
                 echo "✅ Connected to $url"
                 kubectl cluster-info
-                kubectl get nodes -o wide
-                kubectl get ns
+                kubectl get nodes -o wide || true
+                kubectl get ns || true
                 return 0
               else
                 echo "TLS/API check failed for $url (trying next)…"
