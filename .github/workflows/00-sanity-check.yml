@@ -1,0 +1,69 @@
+name: YAML Sanity (Ronin runner + kubeconfig)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+jobs:
+  sanity:
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
+    timeout-minutes: 60
+
+    env:
+      KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
+      RAW_KCFG: ${{ secrets.KUBECONFIG }}
+      KCFG_B64: ${{ secrets.KUBECONFIG_B64 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mask secrets
+        shell: bash
+        run: |
+          if [ -n "${RAW_KCFG:-}" ]; then
+            echo "::add-mask::$RAW_KCFG"
+          fi
+          if [ -n "${KCFG_B64:-}" ]; then
+            echo "::add-mask::$KCFG_B64"
+          fi
+
+      - name: Ensure kubectl is available (no sudo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSL -o "$HOME/.local/bin/kubectl" \
+              "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x "$HOME/.local/bin/kubectl"
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write kubeconfig from secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${RAW_KCFG:-}" ]; then
+            echo "Using RAW kubeconfig from secret KUBECONFIG"
+            printf '%s' "$RAW_KCFG" > "$KUBECONFIG_PATH"
+          elif [ -n "${KCFG_B64:-}" ]; then
+            echo "Using base64 kubeconfig from secret KUBECONFIG_B64"
+            printf '%s' "$KCFG_B64" | base64 -d > "$KUBECONFIG_PATH"
+          else
+            echo "::error::No kubeconfig secret found"
+            exit 1
+          fi
+          chmod 600 "$KUBECONFIG_PATH"
+
+      - name: Sanity check cluster connectivity
+        shell: bash
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        run: |
+          set -euo pipefail
+          echo "== kubectl client version =="
+          kubectl version
+          echo "== Cluster nodes =="
+          kubectl get nodes -o wide
