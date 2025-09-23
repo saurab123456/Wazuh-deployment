@@ -31,9 +31,9 @@ Check connectivity:
 kubectl get nodes -o wide
 kubectl -n wazuh get pods
 
-2. Storage Setup
+### 2. Storage Setup
 
-Workflow: 02-storage-wazuh.yml
+**Workflow:** 02-storage-wazuh.yml
 Creates persistent volumes and PVCs for Wazuh components:
 
 kubectl -n wazuh get pvc
