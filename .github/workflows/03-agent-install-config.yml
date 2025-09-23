@@ -22,17 +22,14 @@ jobs:
       KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
       RAW_KCFG: ${{ secrets.KUBECONFIG }}
       KCFG_B64: ${{ secrets.KUBECONFIG_B64 }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Mask secrets
         shell: bash
         run: |
           if [ -n "${RAW_KCFG:-}" ]; then echo "::add-mask::$RAW_KCFG"; fi
           if [ -n "${KCFG_B64:-}" ]; then echo "::add-mask::$KCFG_B64"; fi
-
       - name: Ensure kubectl is available (no sudo)
         shell: bash
         run: |
@@ -44,37 +41,29 @@ jobs:
             chmod +x "$HOME/.local/bin/kubectl"
           fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
       - name: Write kubeconfig from secrets
         shell: bash
         run: |
           set -euo pipefail
           if [ -n "${RAW_KCFG:-}" ]; then
-            echo "Using RAW kubeconfig from secret KUBECONFIG"
             printf '%s' "$RAW_KCFG" > "$KUBECONFIG_PATH"
           elif [ -n "${KCFG_B64:-}" ]; then
-            echo "Using base64 kubeconfig from secret KUBECONFIG_B64"
             printf '%s' "$KCFG_B64" | base64 -d > "$KUBECONFIG_PATH"
           else
-            echo "::error::No kubeconfig secret found (set KUBECONFIG or KUBECONFIG_B64)"
+            echo "::error::No kubeconfig secret (set KUBECONFIG or KUBECONFIG_B64)"
             exit 1
           fi
           chmod 600 "$KUBECONFIG_PATH"
-
       - name: Sanity check cluster connectivity
         shell: bash
-        env:
-          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        env: { KUBECONFIG: ${{ env.KUBECONFIG_PATH }} }
         run: |
           set -euo pipefail
-          echo "== kubectl version =="
           kubectl version
-          echo "== Cluster nodes =="
           kubectl get nodes -o wide
 
   agent:
     name: Install Wazuh Agent (passwordless enrollment)
-    # Run only on manual dispatch, and only after sanity passes
     if: ${{ github.event_name == 'workflow_dispatch' }}
     needs: [sanity]
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
@@ -86,7 +75,6 @@ jobs:
       NS: wazuh
       KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
       GROUPS: ${{ inputs.groups }}
-      # Accept any of these three secrets. Set at least one in repo secrets.
       RAW_KCFG: ${{ secrets.KUBECONFIG }}
       KCFG_OLD_B64: ${{ secrets.KUBECONFIG_B64 }}
       KCFG_NEW_B64: ${{ secrets.KUBE_CONFIG_B64 }}
@@ -94,14 +82,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Mask secrets
-        shell: bash
-        run: |
-          for v in RAW_KCFG KCFG_OLD_B64 KCFG_NEW_B64; do
-            eval "val=\${$v:-}"
-            if [ -n "$val" ]; then echo "::add-mask::$val"; fi
-          done
 
       - name: Ensure kubectl & jq (no sudo)
         shell: bash
@@ -120,52 +100,46 @@ jobs:
           fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Write kubeconfig from secret (supports raw or base64; old/new names)
+      - name: Write kubeconfig (supports raw or base64; old/new names)
         shell: bash
         run: |
           set -euo pipefail
           if [ -n "${RAW_KCFG:-}" ]; then
-            echo "Using RAW kubeconfig from KUBECONFIG"
             printf '%s' "$RAW_KCFG" > "$KUBECONFIG_PATH"
           elif [ -n "${KCFG_NEW_B64:-}" ]; then
-            echo "Using base64 kubeconfig from KUBE_CONFIG_B64"
             printf '%s' "$KCFG_NEW_B64" | base64 -d > "$KUBECONFIG_PATH"
           elif [ -n "${KCFG_OLD_B64:-}" ]; then
-            echo "Using base64 kubeconfig from KUBECONFIG_B64"
             printf '%s' "$KCFG_OLD_B64" | base64 -d > "$KUBECONFIG_PATH"
           else
-            echo "::error::No kubeconfig secret found. Set one of: KUBECONFIG, KUBE_CONFIG_B64, or KUBECONFIG_B64"
+            echo "::error::No kubeconfig secret (KUBECONFIG, KUBE_CONFIG_B64, or KUBECONFIG_B64)"
             exit 1
           fi
           chmod 600 "$KUBECONFIG_PATH"
-        env:
-          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        env: { KUBECONFIG: ${{ env.KUBECONFIG_PATH }} }
 
-      - name: Verify cluster access
+      - name: Verify manager pods exist
         shell: bash
-        env:
-          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        env: { KUBECONFIG: ${{ env.KUBECONFIG_PATH }} }
         run: |
           set -euo pipefail
-          kubectl -n "$NS" get pods -l app=wazuh-manager >/dev/null
+          kubectl -n "$NS" get pods -l app=wazuh-manager
 
       - name: Create Agent ConfigMap (passwordless)
         shell: bash
-        env:
-          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        env: { KUBECONFIG: ${{ env.KUBECONFIG_PATH }} }
         run: |
           set -euo pipefail
           cat > /tmp/agent-ossec.conf <<'EOF'
           <ossec_config>
             <client>
               <server>
-                <address>wazuh-workers.wazuh.svc.cluster.local</address>
+                <address>wazuh-manager-master-0.wazuh.svc.cluster.local</address>
                 <port>1514</port>
                 <protocol>tcp</protocol>
               </server>
               <enrollment>
                 <enabled>yes</enabled>
-                <manager_address>wazuh-authd-master.wazuh.svc.cluster.local</manager_address>
+                <manager_address>wazuh-manager-master-0.wazuh.svc.cluster.local</manager_address>
                 <port>1515</port>
                 <use_password>no</use_password>
                 <ssl_verify_host>no</ssl_verify_host>
@@ -176,7 +150,7 @@ jobs:
           EOF
           kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
 
-      - name: Deploy Agent DaemonSet (requests only)
+      - name: Deploy Agent DaemonSet (passwordless)
         shell: bash
         env:
           GROUPS: ${{ env.GROUPS }}
@@ -214,7 +188,7 @@ jobs:
                       - name: AUTHD_PORT
                         value: "1515"
                       - name: MANAGER_DNS
-                        value: "wazuh-authd-master.wazuh.svc.cluster.local"
+                        value: "wazuh-manager-master-0.wazuh.svc.cluster.local"
                       - name: GROUPS
                         value: "${GROUPS}"
                     command: ["/bin/sh","-c"]
@@ -223,11 +197,11 @@ jobs:
                         set -e
                         AGENT_NAME="${NODE_NAME}"
                         echo "Agent name: $AGENT_NAME"
+                        echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS:-kubernetes})…"
                         mkdir -p /var/ossec/var/run /var/ossec/queue/sockets /var/ossec/queue/db
                         cp /config/ossec.conf /var/ossec/etc/ossec.conf 2>/dev/null || true
                         rm -f /var/ossec/var/run/*.pid /var/ossec/var/*.lock 2>/dev/null || true
                         enroll() {
-                          echo "Enrolling to ${MANAGER_DNS}:${AUTHD_PORT} (group=${GROUPS:-kubernetes})…"
                           /var/ossec/bin/agent-auth -m "${MANAGER_DNS}" -p "${AUTHD_PORT}" -A "${AGENT_NAME}" -G "${GROUPS:-kubernetes}"
                         }
                         if [ ! -s /var/ossec/etc/client.keys ]; then
@@ -277,21 +251,19 @@ jobs:
           kubectl -n "$NS" rollout status ds/wazuh-agent --timeout=600s || true
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
 
-      - name: Probe authd connectivity (1515)
+      - name: Probe DNS/port to authd
         shell: bash
-        env:
-          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        env: { KUBECONFIG: ${{ env.KUBECONFIG_PATH }} }
         run: |
           set -euo pipefail
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
           kubectl -n "$NS" run probe-authd --image=busybox:1.36 --restart=Never -- \
-            sh -lc 'set -e; nslookup wazuh-authd-master || true; for i in $(seq 1 12); do nc -vz -w 2 wazuh-authd-master 1515 && exit 0; echo retry; sleep 2; done; exit 1'
+            sh -lc 'set -e; nslookup wazuh-manager-master-0.wazuh.svc.cluster.local; for i in $(seq 1 12); do nc -vz -w 2 wazuh-manager-master-0.wazuh.svc.cluster.local 1515 && exit 0; echo retry; sleep 2; done; exit 1'
           kubectl -n "$NS" logs pod/probe-authd || true
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
 
       - name: Final agent status
         shell: bash
-        env:
-          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        env: { KUBECONFIG: ${{ env.KUBECONFIG_PATH }} }
         run: |
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
