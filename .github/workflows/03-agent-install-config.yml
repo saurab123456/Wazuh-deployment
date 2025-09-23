@@ -123,6 +123,7 @@ jobs:
         run: |
           set -euo pipefail
           kubectl -n "$NS" get pods -l app=wazuh-manager
+          kubectl -n "$NS" get svc wazuh -o wide
 
       - name: Create Agent ConfigMap (passwordless)
         shell: bash
@@ -148,7 +149,8 @@ jobs:
   </client>
 </ossec_config>
 EOF
-          kubectl -n "$NS" create configmap wazuh-agent-ossec --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
+          kubectl -n "$NS" create configmap wazuh-agent-ossec \
+            --from-file=ossec.conf=/tmp/agent-ossec.conf -o yaml --dry-run=client | kubectl apply -f -
 
       - name: Deploy Agent DaemonSet (passwordless)
         shell: bash
