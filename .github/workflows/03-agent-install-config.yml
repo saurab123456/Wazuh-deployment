@@ -1,4 +1,4 @@
-name: 02) Install Wazuh Agent (passwordless enrollment)
+name: 02) Install Wazuh Agent (passwordless) + Sanity
 
 on:
   workflow_dispatch:
@@ -7,52 +7,152 @@ on:
         description: "Agent group(s) to enroll"
         required: true
         default: "kubernetes"
+  push:
+    branches: ["main"]
 
 permissions:
   contents: read
 
-concurrency:
-  group: agent-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  agent:
-    # Hard guard: run ONLY when manually dispatched
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+  sanity:
+    name: YAML Sanity (Ronin runner + kubeconfig)
     runs-on: [self-hosted, linux, ronin, k8s, control-plane]
     timeout-minutes: 60
     env:
-      NS: wazuh
-      KUBECONFIG: ${{ github.workspace }}/kubeconfig.yaml
-      GROUPS: ${{ inputs.groups }}
+      KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
+      RAW_KCFG: ${{ secrets.KUBECONFIG }}
+      KCFG_B64: ${{ secrets.KUBECONFIG_B64 }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure jq (no sudo) to $HOME/bin
+      - name: Mask secrets
         shell: bash
         run: |
-          set -e
-          mkdir -p "$HOME/bin"
-          if ! command -v jq >/dev/null 2>&1; then
-            curl -sSL -o "$HOME/bin/jq" https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
-            chmod +x "$HOME/bin/jq"
-          fi
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+          if [ -n "${RAW_KCFG:-}" ]; then echo "::add-mask::$RAW_KCFG"; fi
+          if [ -n "${KCFG_B64:-}" ]; then echo "::add-mask::$KCFG_B64"; fi
 
-      - name: Write kubeconfig from secret
+      - name: Ensure kubectl is available (no sudo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSL -o "$HOME/.local/bin/kubectl" \
+              "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x "$HOME/.local/bin/kubectl"
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write kubeconfig from secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${RAW_KCFG:-}" ]; then
+            echo "Using RAW kubeconfig from secret KUBECONFIG"
+            printf '%s' "$RAW_KCFG" > "$KUBECONFIG_PATH"
+          elif [ -n "${KCFG_B64:-}" ]; then
+            echo "Using base64 kubeconfig from secret KUBECONFIG_B64"
+            printf '%s' "$KCFG_B64" | base64 -d > "$KUBECONFIG_PATH"
+          else
+            echo "::error::No kubeconfig secret found (set KUBECONFIG or KUBECONFIG_B64)"
+            exit 1
+          fi
+          chmod 600 "$KUBECONFIG_PATH"
+
+      - name: Sanity check cluster connectivity
         shell: bash
         env:
-          KUBE_CONFIG_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
         run: |
-          set -e
-          test -n "${KUBE_CONFIG_B64:-}" || { echo "::error::Secret KUBE_CONFIG_B64 missing"; exit 1; }
-          echo "$KUBE_CONFIG_B64" | base64 -d > "$KUBECONFIG"
+          set -euo pipefail
+          echo "== kubectl version =="
+          kubectl version
+          echo "== Cluster nodes =="
+          kubectl get nodes -o wide
+
+  agent:
+    name: Install Wazuh Agent (passwordless enrollment)
+    # Run only on manual dispatch, and only after sanity passes
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [sanity]
+    runs-on: [self-hosted, linux, ronin, k8s, control-plane]
+    timeout-minutes: 60
+    concurrency:
+      group: agent-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      NS: wazuh
+      KUBECONFIG_PATH: ${{ github.workspace }}/kubeconfig.yaml
+      GROUPS: ${{ inputs.groups }}
+      # Accept any of these three secrets. Set at least one in repo secrets.
+      RAW_KCFG: ${{ secrets.KUBECONFIG }}
+      KCFG_OLD_B64: ${{ secrets.KUBECONFIG_B64 }}
+      KCFG_NEW_B64: ${{ secrets.KUBE_CONFIG_B64 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Mask secrets
+        shell: bash
+        run: |
+          for v in RAW_KCFG KCFG_OLD_B64 KCFG_NEW_B64; do
+            eval "val=\${$v:-}"
+            if [ -n "$val" ]; then echo "::add-mask::$val"; fi
+          done
+
+      - name: Ensure kubectl & jq (no sudo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          if ! command -v kubectl >/dev/null 2>&1; then
+            curl -fsSL -o "$HOME/.local/bin/kubectl" \
+              "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x "$HOME/.local/bin/kubectl"
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            curl -fsSL -o "$HOME/.local/bin/jq" \
+              https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64
+            chmod +x "$HOME/.local/bin/jq"
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write kubeconfig from secret (supports raw or base64; old/new names)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${RAW_KCFG:-}" ]; then
+            echo "Using RAW kubeconfig from KUBECONFIG"
+            printf '%s' "$RAW_KCFG" > "$KUBECONFIG_PATH"
+          elif [ -n "${KCFG_NEW_B64:-}" ]; then
+            echo "Using base64 kubeconfig from KUBE_CONFIG_B64"
+            printf '%s' "$KCFG_NEW_B64" | base64 -d > "$KUBECONFIG_PATH"
+          elif [ -n "${KCFG_OLD_B64:-}" ]; then
+            echo "Using base64 kubeconfig from KUBECONFIG_B64"
+            printf '%s' "$KCFG_OLD_B64" | base64 -d > "$KUBECONFIG_PATH"
+          else
+            echo "::error::No kubeconfig secret found. Set one of: KUBECONFIG, KUBE_CONFIG_B64, or KUBECONFIG_B64"
+            exit 1
+          fi
+          chmod 600 "$KUBECONFIG_PATH"
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+
+      - name: Verify cluster access
+        shell: bash
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        run: |
+          set -euo pipefail
           kubectl -n "$NS" get pods -l app=wazuh-manager >/dev/null
 
       - name: Create Agent ConfigMap (passwordless)
         shell: bash
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
         run: |
           set -euo pipefail
           cat > /tmp/agent-ossec.conf <<'EOF'
@@ -80,6 +180,7 @@ jobs:
         shell: bash
         env:
           GROUPS: ${{ env.GROUPS }}
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
         run: |
           set -euo pipefail
           kubectl -n "$NS" delete ds wazuh-agent --ignore-not-found=true
@@ -114,7 +215,8 @@ jobs:
                         value: "1515"
                       - name: MANAGER_DNS
                         value: "wazuh-authd-master.wazuh.svc.cluster.local"
-                      # GROUPS comes from the pod env; script defaults to kubernetes if empty
+                      - name: GROUPS
+                        value: "${GROUPS}"
                     command: ["/bin/sh","-c"]
                     args:
                       - |
@@ -177,6 +279,8 @@ jobs:
 
       - name: Probe authd connectivity (1515)
         shell: bash
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
         run: |
           set -euo pipefail
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
@@ -187,5 +291,7 @@ jobs:
 
       - name: Final agent status
         shell: bash
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
         run: |
           kubectl -n "$NS" get pods -l app=wazuh-agent -o wide
