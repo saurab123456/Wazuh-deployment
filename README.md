@@ -39,9 +39,9 @@ Creates persistent volumes and PVCs for Wazuh components:
 kubectl -n wazuh get pvc
 kubectl -n wazuh get pv
 
-3. Wazuh Core Deployment
+### 3. Wazuh Core Deployment
 
-Workflow: 03-wazuh-deployment.yml
+**Workflow:** 03-wazuh-deployment.yml
 Deploys the main SOC stack:
 
 kubectl -n wazuh get pods -l app=wazuh-manager
