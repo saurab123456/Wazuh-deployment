@@ -133,13 +133,13 @@ jobs:
           <ossec_config>
             <client>
               <server>
-                <address>wazuh-manager-master-0.wazuh.svc.cluster.local</address>
+                <address>wazuh.wazuh.svc.cluster.local</address>
                 <port>1514</port>
                 <protocol>tcp</protocol>
               </server>
               <enrollment>
                 <enabled>yes</enabled>
-                <manager_address>wazuh-manager-master-0.wazuh.svc.cluster.local</manager_address>
+                <manager_address>wazuh.wazuh.svc.cluster.local</manager_address>
                 <port>1515</port>
                 <use_password>no</use_password>
                 <ssl_verify_host>no</ssl_verify_host>
@@ -188,7 +188,7 @@ jobs:
                       - name: AUTHD_PORT
                         value: "1515"
                       - name: MANAGER_DNS
-                        value: "wazuh-manager-master-0.wazuh.svc.cluster.local"
+                        value: "wazuh.wazuh.svc.cluster.local"
                       - name: GROUPS
                         value: "${GROUPS}"
                     command: ["/bin/sh","-c"]
@@ -258,7 +258,7 @@ jobs:
           set -euo pipefail
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
           kubectl -n "$NS" run probe-authd --image=busybox:1.36 --restart=Never -- \
-            sh -lc 'set -e; nslookup wazuh-manager-master-0.wazuh.svc.cluster.local; for i in $(seq 1 12); do nc -vz -w 2 wazuh-manager-master-0.wazuh.svc.cluster.local 1515 && exit 0; echo retry; sleep 2; done; exit 1'
+            sh -lc 'set -e; nslookup wazuh.wazuh.svc.cluster.local; for i in $(seq 1 12); do nc -vz -w 2 wazuh.wazuh.svc.cluster.local 1515 && exit 0; echo retry; sleep 2; done; exit 1'
           kubectl -n "$NS" logs pod/probe-authd || true
           kubectl -n "$NS" delete pod probe-authd --ignore-not-found=true
 
